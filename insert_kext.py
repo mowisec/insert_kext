@@ -29,7 +29,7 @@ Design notes that matter if you port this:
 import argparse, json, os, re, secrets, struct, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ikext import image as imageio, ksysctl
+from ikext import image as imageio
 from ikext.macho import MachO, chained_fixups
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -199,7 +199,7 @@ CFLAGS = [
 ]
 
 
-def _link(cfg, srcs, base, tmp, tag):
+def _link(cfg, srcs, base, tmp, tag, defines=None):
     inc = os.path.join(KEXT_DIR, "include")
     gen = os.path.join(tmp, "kaddrs.h")
     if not os.path.exists(gen):
@@ -208,6 +208,8 @@ def _link(cfg, srcs, base, tmp, tag):
                     "#ifndef KADDRS_H\n#define KADDRS_H\n")
             for k, v in cfg.get("symbols", {}).items():
                 f.write(f"#define KADDR_{k} {v:#x}ULL\n")
+            for k, v in (defines or {}).items():
+                f.write(f"#define {k} {v}\n")
             f.write("#endif\n")
 
     def compile(s_):
@@ -246,7 +248,7 @@ def _link(cfg, srcs, base, tmp, tag):
             seg["va"] + (lo - seg["foff"]))
 
 
-def build_blob(cfg, srcs):
+def build_blob(cfg, srcs, defines=None):
     """Source -> raw blob, linked to sit exactly where it will be spliced.
 
     Three links.  The first is a probe, only to measure how far into __TEXT the
@@ -269,10 +271,10 @@ def build_blob(cfg, srcs):
     target = cfg["slack"]["va"]
     PROBE = 0xfffffe0000000000
     with tempfile.TemporaryDirectory() as t:
-        _, _, probe_base = _link(cfg, srcs, PROBE, t, "probe")
+        _, _, probe_base = _link(cfg, srcs, PROBE, t, "probe", defines)
         hdr = probe_base - PROBE
-        blob_a, syms_a, base_a = _link(cfg, srcs, target - hdr, t, "a")
-        blob_b, _, _ = _link(cfg, srcs, target - hdr + 0x100000, t, "b")
+        blob_a, syms_a, base_a = _link(cfg, srcs, target - hdr, t, "a", defines)
+        blob_b, _, _ = _link(cfg, srcs, target - hdr + 0x100000, t, "b", defines)
     if base_a != target:
         raise SystemExit(f"linker put the kext at {base_a:#x}, wanted {target:#x}")
     if len(blob_a) != len(blob_b):
@@ -399,7 +401,18 @@ def cmd_insert(cfg, img, args):
     d = bytearray(img["raw"])
     slack = cfg["slack"]
     srcs = args.kext or [os.path.join(KEXT_DIR, "hello.c")]
-    blob, meta = build_blob(cfg, srcs)
+    defines = {}
+    if args.sysctl:
+        need = ("sysctl_register_oid", "sysctl_parent_children", "scratch",
+                "sysctl_handle_int")
+        missing = [k for k in need if k not in cfg.get("symbols", {})]
+        if missing:
+            raise SystemExit("--sysctl needs these in the config's symbols map: "
+                             + ", ".join(missing))
+        defines = {"IK_SYSCTL_NAME": '"%s"' % args.sysctl,
+                   "IK_SYSCTL_DESCR": '"%s"' % args.sysctl_descr,
+                   "IK_SYSCTL_VALUE": str(args.sysctl_value)}
+    blob, meta = build_blob(cfg, srcs, defines)
     print(f"kext:   {', '.join(os.path.basename(s) for s in srcs)}  "
           f"{len(blob)} bytes, {slack['size'] - len(blob)} bytes of slack left")
     if len(blob) > slack["size"]:
@@ -480,21 +493,17 @@ def cmd_insert(cfg, img, args):
                              enc_branch(site, meta["entry"], link=bool(old & 0x80000000)))
         print(f"  {len(sites['sites'])} sites  hook {name!r} -> {meta['entry']:#x}")
 
-    # 4. The sysctl node, registered in the image.  See ikext/ksysctl.py for
-    #    why it cannot be registered at runtime on this kernel.
+    # 4. The sysctl node.  Nothing is spliced for it: the kext registers it
+    #    itself at runtime, because a signature the CPU will authenticate is
+    #    better produced by that CPU than asked of the loader.  See
+    #    kext/include/ksysctl.h for the hardware result that settled this.
     if args.sysctl:
-        rep = ksysctl.install(d, cfg, meta["sysctl_entry"], args.sysctl,
-                              args.sysctl_descr, args.sysctl_value)
-        path = cfg["sysctl"].get("parent_path", "")
-        full = f"{path}.{rep['name']}" if path else rep["name"]
-        print(f"  {rep['oid_va']:#09x}  sysctl {full!r} -> handler "
-              f"{rep['handler']:#x}, returns {rep['arg2']}")
-        print(f"            kind {rep['kind']:#010x}  number {rep['number']}  "
-              f"parent list head {rep['head']:#x}")
-        print(f"            PAC: oid_parent key {rep['parent_pac'][0]} div "
-              f"{rep['parent_pac'][1]:#06x} addrDiv {rep['parent_pac'][2]}; "
-              f"oid_handler key {rep['handler_pac'][0]} div "
-              f"{rep['handler_pac'][1]:#06x} addrDiv {rep['handler_pac'][2]}")
+        path = cfg.get("sysctl_parent_path", "")
+        full = "%s.%s" % (path, args.sysctl) if path else args.sysctl
+        print("  sysctl %r registered at runtime by the kext (handler %#x, "
+              "reads back %d)" % (full, meta["sysctl_entry"], args.sysctl_value))
+        print("            one-shot guard + struct sysctl_oid in scratch at %#x"
+              % cfg["symbols"]["scratch"])
 
     # 5. The build tag, always.
     tag = stamp_build_tag(d, cfg)
