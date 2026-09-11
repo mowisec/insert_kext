@@ -37,15 +37,15 @@ On the device:
 
 ```
 $ uname -a                       # must match the build tag above
-Darwin ... root:xnu-...~5/IKCEFFB_ARM64_T8150 arm64
-$ sysctl debug.insert_kext
+Darwin ... root:xnu-...~5/IKC8EA0_ARM64_T8150 arm64
+$ sysctl debug.insert_kext       # also the trigger for the IOKit part below
 debug.insert_kext: 42
 $ sysctl -d debug.insert_kext
 debug.insert_kext: insert_kext example node
 $ dmesg | grep insert_kext
 hello from insert_kext (boot hook), slide=000000002ee78000
 hello from insert_kext (sysctl), slide=000000002ee78000
-$ ioreg -l -d 1 | grep insert_kext          # the example kext reaches IOKit too
+$ ioreg -l -d 1 | grep insert_kext   # see "Reaching IOKit" for what these are
       "insert_kext" = "hello"
 $ ioreg | grep insert_kext
     +-o insert_kext  <class IOService, id 0x100001012, registered, matched, active, ...>
@@ -503,13 +503,62 @@ IOService::attach(obj, IOService::getServiceRoot());
 IOService::registerService(obj, 0);
 ```
 
-```
-$ ioreg | grep insert_kext
-    +-o insert_kext  <class IOService, id 0x100001012, registered, matched, active, ...>
-```
-
 Both compile away unless the addresses are in the config's `symbols` map, so
 this costs nothing on an image you have not resolved them for.
+
+### Seeing it with `ioreg`
+
+**Read the sysctl first.** Nothing exists in the registry until something calls
+the code, and in the example kext the sysctl handler is what does. Run `ioreg`
+before that and you will correctly see nothing:
+
+```
+$ ioreg | grep insert_kext            # nothing yet -- the code has not run
+$ sysctl debug.insert_kext            # this is the trigger
+debug.insert_kext: 42
+```
+
+Now both are visible. They live in different places, so they need different
+commands:
+
+```
+$ ioreg -l -d 1 | grep insert_kext    # -d 1 = the root node only, -l = with properties
+      "insert_kext" = "hello"
+
+$ ioreg | grep insert_kext            # the node tree; no -l, so only names match
+    +-o insert_kext  <class IOService, id 0x100001012, registered, matched, active, busy 0 (1 ms), retain 6>
+```
+
+The full root node, for context — the property sits among the kernel's own:
+
+```
+$ ioreg -l -d 1
++-o Root  <class IORegistryEntry, id 0x100000100, retain 47>
+    {
+      "IOKitBuildVersion" = "Darwin Kernel Version 27.0.0: ... /IKF8312_ARM64_T8150"
+      "OS Build Version" = "24A5424a"
+      ...
+      "insert_kext" = "hello"
+```
+
+Reading the node's line:
+
+| | |
+|---|---|
+| `class IOService` | the stock class — the object was allocated by the runtime, not defined by you |
+| `registered` | `registerService()` completed |
+| `matched` | matching ran against it. It found nothing, because there is no personality; this does **not** mean a driver bound |
+| `active` | attached to the plane and not terminated |
+| `retain 6` | the registry's own references |
+
+`ioreg -l` on its own prints the whole tree with every property, which is
+megabytes; `grep` it or use `-d <depth>` to bound it. If the node is not there
+after a sysctl read, check `dmesg | grep "insert_kext (node)"` — each failure
+step logs its own line rather than failing silently.
+
+On a stripped-down device `ioreg` may not be on the default `PATH`; it is a
+diagnostics tool and lives wherever that device keeps them, the same place
+`check --tool-dir` points at for `sysctl` and `dmesg`.
 
 ### It defines no C++ class, and that is deliberate
 
