@@ -690,27 +690,42 @@ scope and depends on what the device lets you do.
 
 ## Porting to another kernelcache
 
-Write a config in `configs/`. The fields:
+Everything the tool knows about a particular image is one JSON file in
+`configs/`, chosen **by content**: `insert` hashes the decompressed Mach-O and
+matches `identify.sha256`, so a config can never be silently applied to the
+wrong image.
+
+The work splits into a mechanical half the tool does for you, and a manual half
+that is the real cost. Below in the order to do it.
 
 ```jsonc
 {
-  "identify": { "sha256": "...", "marker": "RELEASE_ARM64_T8150" },
-  "map_base": "0xfffffe0007004000",        // VA = map_base + file_offset
-  "slack":    { "file_off": "0x4368008", "va": "0xfffffe000b36c008",
-                "size": 16376, "preceded_by": "bf4100d5c0035fd6" },
+  "identify":  { "sha256": "...",                 // of the DECOMPRESSED Mach-O
+                 "marker": "RELEASE_ARM64_T8150" },
+  "map_base":  "0xfffffe0007004000",              // VA = map_base + file_offset
+  "slack":     { "file_off": "...", "va": "...", "size": 16376,
+                 "preceded_by": "bf4100d5c0035fd6" },
   "build_tag": { "stock": "RELEASE_ARM64_T8150", "prefix": "IK", "count": 2 },
-  "symbols":  { "panic": "0x...", "_os_log_internal": "0x..." },
-  "hooks":    { "name": { "expect_target": "0x...", "sites": ["0x...", ...],
-                          "default_tail": "branch:0x..." } },
-  "sysctl":   { ... }                       // see configs/ for the full shape
+  "symbols":   { "panic": "0x...", ... },         // the work
+  "hooks":     { "name": { "expect_target": "0x...", "sites": ["0x...", ...],
+                           "default_tail": "branch:0x..." } },
+  "sysctl_parent_path": "debug",
+  "sysent_table":  { ... },                       // optional, for --syscall-slot
+  "extra_patches": { ... }                        // optional, for --extra
 }
 ```
 
-**1. `map_base`.** Run `insert_kext info`. It prints every segment and checks
-`VA == map_base + file_offset`, and refuses to go on if that does not hold,
+### The mechanical half — minutes
+
+**1. `identify`.** `sha256` of the decompressed kernelcache. `marker` is a
+fallback that identifies the build but not the exact image, so a marker-only
+match warns and every address should be re-derived before it is trusted.
+
+**2. `map_base`.** Run `insert_kext info`. It prints every segment, checks
+`VA == map_base + file_offset`, and **refuses to go on if that does not hold**,
 because everything else assumes it.
 
-**2. `slack`.** Run `insert_kext slack`. It reports the longest zero run per
+**3. `slack`.** Run `insert_kext slack`. It reports the longest zero run per
 segment and flags the executable ones. Take the biggest run in an `r-x`
 segment.
 
@@ -725,8 +740,14 @@ same `0x3ff8` appears in a *different device's* kernelcache of the same build,
 despite different segment sizes, both ending in the same 16 bytes. On a new
 target, treat it as unproven until a kext that only logs has run.
 
-**3. `symbols`.** iOS kernelcaches export essentially nothing, so this is
-manual work. What works:
+**4. `build_tag`.** `stock` is the configuration field of the kernel version
+string, which `info` shows. It is replaced in place at the same length, so
+`uname -a` names exactly which image booted.
+
+### The manual half — where the hours go
+
+**5. `symbols`: plain C functions.** iOS kernelcaches export essentially
+nothing, so this is manual. What works:
 
 * **Format-string convergence.** Collect every format-like C string, xref each
   from executable memory via `adrp`/`add`, follow to the next `BL`, and
@@ -745,16 +766,94 @@ manual work. What works:
 * **Validate a scanner against a known positive before trusting a negative.**
   These scanners have imperfect recall; a zero from one is not absence.
 
-**4. `hooks`.** Find call sites you can prove execute. `expect_target` makes
-the injector refuse if the instruction is not the branch you think it is.
+**6. `symbols`: C++ methods.** The IOKit entry points need a different method,
+and guessing here is expensive — a wrong address passes your arguments to the
+wrong function. In descending order of strength:
 
-**5. `sysctl`.** The addresses to find are the parent node's children list
-(`&sysctl__debug_children`, which is the `debug` node's `oid_arg1`), a
-reference OID to copy PAC fields from, and `sysctl_handle_int`. The staging
-region is whatever padding your image has after the last `__DATA_CONST`
-section; the tool will tell you if it overlaps anything.
+* **A virtual method: read the class vtable.** A tool that recovers C++ class
+  layouts from an arm64e kernelcache by their PAC diversifiers (`iometa` is the
+  one used for the shipped config) gives the entries **exactly**, with real
+  names:
 
----
+  ```
+  0x0a8 func=0x...  IOService::init(OSDictionary*)
+  0x2a0 func=0x...  IOService::registerService(unsigned int)
+  0x360 func=0x...  IOService::attach(IOService*)
+  ```
+
+  This is worth doing even when a symbol table offers a name. For the shipped
+  config it scored `attach` at **0.28** and `registerService` at **0.42** and
+  had no `init` at all — not callable blind — while the vtable gave all three,
+  and its values matched the two low-confidence symbols, so the methods
+  corroborated each other.
+
+* **A non-virtual overload set: differential against a symbolicated kernel.**
+  `IORegistryEntry::setProperty` has six overloads at consecutive addresses,
+  all scoring ~0.42, and disassembly cannot separate them: each calls only
+  `OSSymbol::withCString` for the key and reaches its value constructor
+  indirectly. A fully symbolicated kernel for another platform of the same
+  vintage names all of them, and both the **order** and the **size pattern**
+  carry over even though the addresses do not (85/85/54/54/40/40 there against
+  71/71/48/46/34/38 in the release build — uniformly tighter, same shape).
+
+* **Anything else: verify by behaviour.** `OSMetaClass::allocClassWithName` is
+  not virtual, so it has no slot. It was confirmed by what it calls —
+  `OSSymbol::withCStringNoCopy`, then the `OSSymbol*` overload — which nothing
+  else does.
+
+**7. `hooks`.** Find a call site you can prove executes, and prefer one whose
+message you have **watched leave `dmesg`**, so the site is known to run and its
+context is known safe for what the kext wants to do. `expect_target` makes the
+injector refuse if the instruction is not the branch you think it is. A hook
+may name several sites and all are retargeted — if you are not certain which
+copy of an inlined function runs, hook them all rather than gambling a reboot.
+
+**8. `sysctl_parent_path` and `scratch`.** The addresses to find are the parent
+node's children list (`&sysctl__debug_children`, which is the `debug` node's
+`oid_arg1`), `sysctl_register_oid` and `sysctl_handle_int`. `scratch` is
+writable memory for the OID and the one-shot guards — whatever padding your
+image has after the last `__DATA_CONST` section; the tool will tell you if it
+overlaps anything.
+
+**9. `sysent_table`** (only for `--syscall-slot`) and **`extra_patches`** (only
+for `--extra`) are optional. Nothing else needs them.
+
+### Prove as much as possible without booting
+
+Every one of these runs against the image on your desk, and each has caught a
+real error:
+
+```bash
+insert_kext.py info <image>        # map_base, and the linear-mapping invariant
+insert_kext.py slack <image>       # that the slack is where you think
+insert_kext.py build <image>       # the position-independence proof
+insert_kext.py selftest <image>    # the detour classifier vs llvm-objdump
+insert_kext.py verify <image> <patched>   # every changed byte, branches decoded
+```
+
+`insert` itself asserts what it overwrites: the slack must still be zeros, the
+bytes before it must match `preceded_by`, a hooked instruction must still be
+the branch `expect_target` names. A config that does not match its image fails
+the build rather than producing a bad image.
+
+### What you do *not* need
+
+`--append-kext` and `--prelink-bundle` need **no extra config**. The fileset
+entry, the region covering it and the `__PRELINK_INFO` dictionary are all
+derived from the image itself.
+
+### What to expect
+
+The mechanical half is minutes. The symbols are the cost, and how much depends
+on distance: a kernelcache of the **same build for a different device** is the
+easy case — same structure, different addresses, and every technique above
+transfers directly. A different iOS version is harder, because signatures
+drift. There is no button to press.
+
+Start with the smallest config that can do anything: `map_base`, `slack`,
+`build_tag`, and just `_os_log_internal` plus its two globals. That is enough
+for a kext that only logs, which is also the experiment that tells you whether
+the slack is really free.
 
 ## Layout
 
