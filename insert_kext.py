@@ -1058,9 +1058,10 @@ def main():
     p.add_argument("--append-cover", choices=("exec", "readonly"), default="exec",
                    metavar="MODE",
                    help="how the appended bytes get covered by the IM4P region "
-                        "table.  'exec' re-tiles so they land in an executable "
-                        "region; 'readonly' simply grows the last region over "
-                        "them, which maps them but not executably")
+                        "table.  'readonly' grows the last region over them, "
+                        "which maps them but not executably, and is the shape "
+                        "known to load.  'exec' re-tiles so they land in an "
+                        "executable region -- UNVERIFIED, see props_retile_tail")
     p.add_argument("--append-data-size", type=lambda x: int(x, 0), default=0x4000,
                    metavar="N", help="__DATA bytes for the appended entry "
                                      "(default 0x4000)")

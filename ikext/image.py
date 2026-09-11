@@ -183,8 +183,16 @@ def props_retile_tail(props, payload_len, verbose=True):
         kcbf, kcbz = tail       the freed descriptor is moved onto the append
 
     The regions still tile the payload exactly, still sum to its length, and
-    not one byte of the image has moved.  The appended bytes end up in an
-    executable region with no relink.
+    not one byte of the image has moved.
+
+    NOT VERIFIED, and do not assume it works: an image built this way has been
+    refused before the kernel ran, with no diagnostic, so some further rule
+    governs these two descriptors.  Two candidates, neither tested: the
+    boot-executable region may be required to start exactly where the
+    executable region ends, and it may be required to contain the entry point
+    (`kcep`), which stock images place at its first byte.  Both are broken by
+    the re-tiling above.  `--append-cover readonly` is the shape that is known
+    to load.
     """
     d = props_get(props)
     need = ("kcxf", "kcxz", "kcbf", "kcbz", "kclf", "kclz")
