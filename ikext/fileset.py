@@ -223,7 +223,7 @@ def _seg64(nm, va, vsize, fo, fsize, maxp, initp):
 
 
 def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
-               rx_name="__KEXT_EXEC", rw_name="__KEXT_DATA", top_level=True,
+               rx_name="__KEXT_EXEC", rw_name="__KEXT_DATA",
                exec_at=None, verbose=True):
     """Append one `MH_KEXT_BUNDLE` fileset entry carrying `code`.
 
@@ -242,11 +242,8 @@ def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
     without any change to the region table.  `code` is then not appended; only
     the entry's header page is, covered by one new read-only top-level segment.
 
-    `top_level=False` emits **no** new top-level segments and adds only the
-    `LC_FILESET_ENTRY`, leaving the appended range for the caller to cover by
-    other means -- for instance by repointing an existing top-level segment at
-    it, which keeps the segment count unchanged.  `data_size=0` gives the entry
-    a zero-length `__DATA`, which it must still declare.
+    `data_size=0` gives the entry a zero-length `__DATA`, which it must
+    still declare.
     """
     d = bytearray(raw)
     img = Image(d)
@@ -311,9 +308,7 @@ def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
     fse = struct.pack("<IIQQII", LC_FILESET_ENTRY,
                       32 + align8(len(nm) + 1), rx_va, hdr_fo, 32, 0)
     fse += nm + b"\0" * (align8(len(nm) + 1) - len(nm))
-    if not top_level:
-        newcmds, ncmds_added = fse, 1
-    elif exec_at:
+    if exec_at:
         # Only the header page is appended, and it is not executable: the code
         # is elsewhere, inside a segment the image already has.
         newcmds = _seg64(rx_name.encode(), rx_va, rx_fsize, hdr_fo,
@@ -349,8 +344,8 @@ def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
                 grown=len(d) - orig_len, length=len(d))
     if verbose:
         print(f"\nappended fileset entry {name!r}")
-        print(f"  {rx_name if top_level else '(no top-level)':<14} "
-              f"va {rx_va:#x}  fo {hdr_fo:#x}  {rx_fsize} bytes  r-x")
+        print(f"  {rx_name:<14} va {rx_va:#x}  fo {hdr_fo:#x}  "
+              f"{rx_fsize} bytes  r-x")
         print(f"  {'__TEXT_EXEC':<12} va {geom['exec_va']:#x}  fo {exec_fo:#x}  "
               f"{exec_sz} bytes  <- the code")
         print(f"  {rw_name:<12} va {rw_va:#x}  fo {data_fo:#x}  {rw_fsize} bytes  rw-")

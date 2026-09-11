@@ -420,31 +420,10 @@ def cmd_insert(cfg, img, args):
     # existing offset, so the destination address is known from the current
     # image length alone.
     append = args.append_kext
-    in_slack = append and args.append_exec == "slack"
-    if in_slack and args.append_data_size:
-        # In slack mode only the entry's header page is appended, so a
-        # non-zero __DATA would sit past the end of the image and fail the
-        # containment invariant.  The kext cannot have writable data anyway --
-        # the linker refuses any non-__TEXT segment -- so this is a correction,
-        # not a restriction.
-        print(f"note: --append-data-size {args.append_data_size} ignored; an "
-              "entry whose code is in the slack has no appended data segment")
-        args.append_data_size = 0
-    absorb = None
+    in_slack = append          # the entry's code goes in the slack
+
     if args.prelink_bundle and not append:
         raise SystemExit("--prelink-bundle only makes sense with --append-kext")
-    if append and (args.append_exec == "appended"
-                   or args.append_cover != "readonly"):
-        print("WARNING: --append-exec appended and every --append-cover other "
-              "than 'readonly' are UNVERIFIED.\n"
-              "         Appended bytes can be mapped but not made executable, "
-              "and every attempt to\n"
-              "         resize or relocate an executable region has been "
-              "refused before the kernel ran.\n"
-              "         Expect a refusal to boot, or an instruction-fetch "
-              "fault on the first call.")
-    if args.absorb_boot_exec and not append:
-        raise SystemExit("--absorb-boot-exec only makes sense with --append-kext")
     if append and not in_slack:
         exec_va = base + len(img["raw"]) + fileset.PAGE
         blob, meta = build_blob(cfg, srcs, defines, target=exec_va)
@@ -643,8 +622,7 @@ def cmd_insert(cfg, img, args):
     #    land in the image the entry is then measured against.
     if append:
         newd, geom = fileset.emit_entry(bytes(d), append, code=bytes(blob),
-                                        data_size=args.append_data_size,
-                                        top_level=not args.absorb_boot_exec,
+                                        data_size=0,
                                         exec_at=((slack["file_off"], slack["va"],
                                                   len(blob)) if in_slack else None))
         if geom["exec_va"] != meta["base"]:
@@ -652,8 +630,6 @@ def cmd_insert(cfg, img, args):
                              f"{geom['exec_va']:#x} but the kext was linked for "
                              f"{meta['base']:#x}")
         d = bytearray(newd)
-        if args.absorb_boot_exec:
-            absorb = absorb_boot_exec(d, geom)
         print()
         if not fileset.check(bytes(d), label="the emitted image", verbose=False):
             raise SystemExit("the emitted image fails its own layout checks")
@@ -690,8 +666,7 @@ def cmd_insert(cfg, img, args):
               "image was written.  Re-run with the .ipsw or the IM4P as <image>, "
               "or pass --stock-im4p.")
         return
-    package(cfg, img, bytes(d), out, cover=getattr(args, "append_cover", "exec"),
-            absorb=absorb)
+    package(cfg, img, bytes(d), out)
     if tag:
         open(out + ".uname", "w").write(tag + "\n")
     json.dump(expect, open(out + ".expect.json", "w"), indent=2)
@@ -728,55 +703,6 @@ def report_diff(a, b, base, gap=16):
             if t is not None:
                 note = f"  branch -> {t:#x}"
         print(f"  file {lo:#09x}  VA {base+lo:#x}  {n} bytes{note}")
-
-
-def absorb_boot_exec(d, geom):
-    """Hand the boot-executable segment over to the appended entry.
-
-    The image has two adjacent executable top-level segments, and the second is
-    small and fixed in size.  This grows the first over the second's range --
-    they are contiguous in file AND in virtual address, so the merged segment
-    describes exactly what it did before -- and then repoints the second at the
-    appended entry instead.
-
-    No load command is added or removed, so nothing that indexes them shifts,
-    and the segment count is unchanged.  The point is to let the IM4P region
-    table say the same thing: an executable region can only be reassigned if
-    the segment table agrees, and editing one without the other leaves the two
-    descriptions contradicting each other.
-    """
-    ncmds, _ = struct.unpack_from("<II", d, 16)
-    off, segs = 32, {}
-    for _ in range(ncmds):
-        cmd, sz = struct.unpack_from("<II", d, off)
-        if cmd == 0x19:
-            nm = bytes(d[off + 8:off + 24]).split(b"\0")[0].decode()
-            vm, vs, fo, fs = struct.unpack_from("<QQQQ", d, off + 24)
-            segs[nm] = dict(off=off, va=vm, vsize=vs, foff=fo, fsize=fs)
-        off += sz
-    for nm in ("__TEXT_EXEC", "__TEXT_BOOT_EXEC"):
-        if nm not in segs:
-            raise SystemExit(f"the image has no top-level {nm}")
-    x, b = segs["__TEXT_EXEC"], segs["__TEXT_BOOT_EXEC"]
-    if b["foff"] != x["foff"] + x["fsize"] or b["va"] != x["va"] + x["vsize"]:
-        raise SystemExit("__TEXT_BOOT_EXEC does not directly follow __TEXT_EXEC "
-                         "in both file and virtual address; refusing to merge")
-    if geom["rx_fsize"] != b["fsize"]:
-        raise SystemExit(
-            f"the appended entry is {geom['rx_fsize']} bytes but "
-            f"__TEXT_BOOT_EXEC is {b['fsize']}.  They must match exactly, so "
-            "the region size does not have to change either; adjust the kext "
-            "or --append-data-size")
-    struct.pack_into("<QQ", d, x["off"] + 32, x["vsize"] + b["vsize"], x["foff"])
-    struct.pack_into("<Q", d, x["off"] + 48, x["fsize"] + b["fsize"])
-    struct.pack_into("<QQQQ", d, b["off"] + 24, geom["hdr_va"], geom["rx_fsize"],
-                     geom["hdr_fo"], geom["rx_fsize"])
-    print("\nsegment table edited:")
-    print(f"  __TEXT_EXEC       {x['fsize']} -> {x['fsize'] + b['fsize']} bytes "
-          f"(absorbs the boot-executable range at {b['foff']:#x})")
-    print(f"  __TEXT_BOOT_EXEC  repointed to fo {geom['hdr_fo']:#x} "
-          f"va {geom['hdr_va']:#x}, {geom['rx_fsize']} bytes (unchanged size)")
-    return dict(kcxz_delta=b["fsize"], kcbf=geom["hdr_fo"])
 
 
 def cmd_package(cfg, img, args):
@@ -820,7 +746,7 @@ def cmd_verify(cfg, img, args):
 
 # --------------------------------------------------------------- package ----
 
-def package(cfg, img, payload, out, cover="exec", absorb=None):
+def package(cfg, img, payload, out):
     """Wrap a patched image as an UNCOMPRESSED IM4P, keeping the stock image's
     properties element.
 
@@ -833,25 +759,17 @@ def package(cfg, img, payload, out, cover="exec", absorb=None):
     """
     tlv, props = imageio.der_tlv, img["props"]
     if len(payload) > len(img["raw"]):
-        if cover == "readonly":
-            d = imageio.props_get(props)
-            grew = len(payload) - (d["kclf"] + d["kclz"])
-            props = imageio.props_set(props, "kclz", d["kclz"] + grew)
-            print(f"\ncovered the appended {grew} bytes by growing the last "
-                  f"region: kclz {d['kclz']} -> {d['kclz'] + grew} "
-                  "(mapped, NOT executable)")
-        elif cover == "boot-exec":
-            dd = imageio.props_get(props)
-            props = imageio.props_set(props, "kcxz", dd["kcxz"] + absorb["kcxz_delta"])
-            props = imageio.props_set(props, "kcbf", absorb["kcbf"])
-            print(f"\nregion table follows the segment table:")
-            print(f"  kcxz  {dd['kcxz']:#x} -> {dd['kcxz'] + absorb['kcxz_delta']:#x}")
-            print(f"  kcbf  {dd['kcbf']:#x} -> {absorb['kcbf']:#x}   "
-                  f"(kcbz unchanged at {dd['kcbz']:#x}, kclz unchanged)")
-        elif cover == "exec-extend":
-            props = imageio.props_extend_boot_exec(props, len(payload))
-        else:
-            props = imageio.props_retile_tail(props, len(payload))
+        # An appended entry's header has to be covered by some region or the
+        # image will not load, and the last one is the only size that may
+        # change: every other kc* size is refused outright.  It maps the bytes
+        # read-only, which is all the header needs -- the code lives in the
+        # slack, inside a region that is already executable.
+        pr = imageio.props_get(props)
+        grew = len(payload) - (pr["kclf"] + pr["kclz"])
+        props = imageio.props_set(props, "kclz", pr["kclz"] + grew)
+        print(f"\ncovered the appended {grew} bytes: kclz {pr['kclz']} -> "
+              f"{pr['kclz'] + grew}")
+
     body = (tlv(0x16, b"IM4P") + tlv(0x16, img["type"].encode())
             + tlv(0x16, img["version"].encode()) + tlv(0x04, payload) + props)
     open(out, "wb").write(tlv(0x30, body))
@@ -1214,39 +1132,16 @@ def main():
     p.add_argument("-o", "--out", help="output IM4P (default kernelcache.insert_kext.im4p)")
     p.add_argument("--append-kext", metavar="BUNDLE_ID",
                    help="put the kext in a NEW fileset entry appended to the "
-                        "end of the image, instead of in existing slack.  Adds "
-                        "a real named bundle with no size ceiling, and re-tiles "
-                        "the IM4P region table so the appended code is "
+                        "end of the image, so the image carries a real named "
+                        "bundle instead of only an anonymous blob.  The entry's "
+                        "header is appended and its code stays in the slack, "
+                        "because appended bytes can be mapped but not made "
                         "executable.  Nothing already in the image moves")
     p.add_argument("--prelink-bundle", action="store_true",
                    help="also add a __PRELINK_INFO bundle dictionary for the "
                         "appended kext, so the kernel's extension registry "
                         "knows it exists.  Codeless, which is what the vendor's "
                         "own pseudo-extensions use")
-    p.add_argument("--append-exec", choices=("appended", "slack"),
-                   default="slack", metavar="WHERE",
-                   help="where the appended entry's code lives.  'appended' "
-                        "puts it in the new bytes at the end of the image; "
-                        "'slack' puts it in the configured slack, which is "
-                        "already inside an executable region, so no region "
-                        "size has to change")
-    p.add_argument("--absorb-boot-exec", action="store_true",
-                   help="edit the SEGMENT TABLE as well: grow __TEXT_EXEC over "
-                        "__TEXT_BOOT_EXEC (contiguous in file and VA) and "
-                        "repoint __TEXT_BOOT_EXEC at the appended entry.  Adds "
-                        "and removes no load command")
-    p.add_argument("--append-cover",
-                   choices=("exec", "exec-extend", "readonly", "boot-exec"),
-                   default="readonly",
-                   metavar="MODE",
-                   help="how the appended bytes get covered by the IM4P region "
-                        "table.  'readonly' grows the last region over them, "
-                        "which maps them but not executably, and is the shape "
-                        "known to load.  'exec' re-tiles so they land in an "
-                        "executable region -- UNVERIFIED, see props_retile_tail")
-    p.add_argument("--append-data-size", type=lambda x: int(x, 0), default=0x4000,
-                   metavar="N", help="__DATA bytes for the appended entry "
-                                     "(default 0x4000)")
     p.add_argument("--kext", action="append",
                    help="kext source; repeatable.  Default: kext/hello.c")
     p.add_argument("--hook", action="append", default=[],

@@ -119,15 +119,16 @@ Everything else is as for slack injection, so `--sysctl`, `--syscall-slot`,
 
 Appended bytes can be **mapped** but not made **executable**: the IM4P region
 table has exactly two executable regions, both already spoken for, and every
-attempt to resize or relocate one is refused before the kernel runs. An
-appended `__TEXT_EXEC` therefore takes an instruction-fetch permission fault
-the moment anything calls it.
+attempt to resize or relocate one is refused before the kernel runs. Four of
+the five region sizes refuse even a one-page change. An appended `__TEXT_EXEC`
+would therefore take an instruction-fetch permission fault the moment anything
+called it.
 
-So `--append-exec slack` puts the entry's **code** in the slack — which is
-already inside an executable region and already runs — while only its header
-page is appended. You get the named bundle and the code, at the slack's size
-limit. `--append-exec appended` exists for images where that calculus differs,
-and will fault on this one.
+So `--append-kext` splits the entry in two: its **code** goes in the slack,
+which is already inside an executable region and already runs, and only its
+**header page** is appended — covered by growing the last region, the one size
+that may change. You get the named bundle and the code, at the slack's size
+limit. This is not configurable, because only one arrangement loads.
 
 ### What "kext" means here
 
@@ -450,15 +451,11 @@ Global options: `--config` (auto-selected by content if omitted), `--variant`
 IM4P properties element when the input is a bare Mach-O), `--set-prop
 NAME=VALUE` (rewrite one `kc*` property before packaging).
 
-`insert` options for an appended entry: `--append-kext <bundle id>`,
-`--append-exec slack|appended`, `--append-data-size N`, `--append-cover
-readonly|exec|exec-extend|boot-exec`, `--prelink-bundle`, `--absorb-boot-exec`.
-
-**The defaults are the shapes that are known to work** — `--append-exec slack`
-and `--append-cover readonly` — so `--append-kext <id>` on its own is the right
-command. The others exist because which region shapes the loader accepts is
-worth being able to ask, they print a warning when selected, and their
-docstrings say plainly that they are unverified.
+`insert` options for an appended entry: `--append-kext <bundle id>` and
+`--prelink-bundle`. There is nothing to tune: where the header goes, where the
+code goes and which region covers the header are all forced by what the loader
+accepts, so the tool does the one thing that works rather than offering choices
+that do not.
 
 Every write asserts what it is overwriting first: the slack must still be all
 zeros, the bytes before it must still match `preceded_by`, a hooked instruction
