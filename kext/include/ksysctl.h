@@ -104,23 +104,36 @@ struct ksysctl_oid {
 #define KCTLFLAG_RD             0x80000000u
 #define KCTLFLAG_LOCKED         0x00800000u
 #define KCTLFLAG_OID2           0x00400000u   /* "has oid_version/oid_refcnt" */
-#define KCTLFLAG_PERMANENT      0x00200000u
+#define KCTLFLAG_PERMANENT      0x00200000u   /* DO NOT SET -- see below */
 
 /*
- * Read-only int, locked, OID2, PERMANENT.
+ * Read-only int, locked, OID2.  NOT PERMANENT, and that is the whole point.
  *
- * PERMANENT is deliberate and does two things.  `sysctl_register_oid` skips
- * the zalloc-and-copy for a permanent OID and registers the struct we pass in
- * place -- no allocation in a context we did not choose.  And `sysctl_root`
- * skips the oid_refcnt increment on every read, which matters because that
- * increment is a store into the OID.
+ * An earlier version set CTLFLAG_PERMANENT, reasoning that it would make
+ * `sysctl_register_oid` register our struct in place instead of allocating,
+ * and make `sysctl_root` skip the oid_refcnt increment.  The first half is
+ * backwards.  The kernel said so, on the first firing of the hook:
+ *
+ *   panic(cpu 4): Use sysctl_register_oid_early to register permanent nodes
+ *                 @kern_newsysctl.c:263
+ *
+ * `sysctl_register_oid` PANICS on a permanent OID; permanent nodes may only be
+ * registered from the startup path, which we are not on.  The instruction is
+ * `tbnz w8, #0x15` on oid_kind, and it branches to the panic, not to an
+ * in-place registration.
+ *
+ * Without PERMANENT the kernel zallocs its own copy of this struct and
+ * registers that, which is better in every way that matters here: the copy is
+ * in writable memory, so `sysctl_root`'s refcount increment and the handler
+ * re-signing both land somewhere they are allowed to, and our template is only
+ * read (bar the assigned oid_number, written back into it).
  *
  * OID2 and oid_version == 1 are both CHECKED by sysctl_register_oid; get
- * either wrong and it refuses.
+ * either wrong and it refuses.  oid_number must also be > -2, so OID_AUTO
+ * (-1) is the only sentinel it will take.
  */
 #define KSYSCTL_KIND_RD_INT \
-	(KCTLTYPE_INT | KCTLFLAG_RD | KCTLFLAG_LOCKED | KCTLFLAG_OID2 | \
-	 KCTLFLAG_PERMANENT)
+	(KCTLTYPE_INT | KCTLFLAG_RD | KCTLFLAG_LOCKED | KCTLFLAG_OID2)
 
 #define KSYSCTL_HANDLER(fn) \
 	__attribute__((used)) \
@@ -178,9 +191,30 @@ ksysctl_register(const char *name, const char *descr, int value)
 	volatile uint64_t *guard = (volatile uint64_t *)kp_addr(KADDR_scratch);
 	struct ksysctl_oid *oid =
 	    (struct ksysctl_oid *)((char *)kp_addr(KADDR_scratch) + 0x40);
+	void *const *head = (void *const *)kp_addr(KADDR_sysctl_parent_children);
 
 	if (*guard == 0x494b534332303236ULL)        /* "IKSC2026" */
 		return 0;
+
+	/*
+	 * DO NOT REGISTER BEFORE THE KERNEL HAS.  The hook fires during early
+	 * boot -- the panic that killed the permanent version landed with
+	 * "OS release type: Not set yet" and Exclaves NOT_STARTED -- and at that
+	 * point the parent's children list may still be empty.
+	 *
+	 * An empty list is not merely early, it is the wrong shape: an OID_AUTO
+	 * registration is routed into the SECOND children list hanging off the
+	 * `__anchor__` entry, and the anchor is only there once the kernel has
+	 * registered it.  A shipped kernelcache leaves this head zero, so
+	 * non-zero is exactly the signal that the sysctl subsystem is up.
+	 *
+	 * Returning 0 without setting the guard means the next firing of the
+	 * hook tries again, which is what makes this safe rather than merely
+	 * late -- the hook fires every few seconds forever.
+	 */
+	if (*head == 0)
+		return 0;
+
 	*guard = 0x494b534332303236ULL;
 
 	oid->oid_parent = ksysctl_sign_da(kp_addr(KADDR_sysctl_parent_children),

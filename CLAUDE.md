@@ -57,10 +57,13 @@ wrong image that looked right.
 Say which, in the README and in commit messages, and do not let the two blur.
 
 * **Proven on hardware:** slack injection, the hook trampoline, the detour, the
-  uncompressed-IM4P packaging, `os_log` reaching `dmesg` from injected code.
-* **Verified statically only:** the `sysctl` registration. Every byte decodes
-  back, every chain walks, the PAC fields match the kernel's own — but it has
-  not been booted. Keep saying so until it has.
+  uncompressed-IM4P packaging, `os_log` reaching `dmesg` from injected code, and
+  the runtime `sysctl` registration — node registered, read back, repeatable,
+  handler logging on every read.
+* **Not established:** the detour has been booted, but only at a function entry
+  (`pacibsp`). Nothing else here is unproven; when you add something that is,
+  say so in this list and in README.md, and keep saying it until a device says
+  otherwise.
 
 A negative result from an experiment that was never run is not a negative
 result. If you cannot test something, write down what would test it.

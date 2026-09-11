@@ -36,9 +36,11 @@ $ uname -a                       # must match the build tag above
 Darwin ... root:xnu-...~5/IKCEFFB_ARM64_T8150 arm64
 $ sysctl debug.insert_kext
 debug.insert_kext: 42
+$ sysctl -d debug.insert_kext
+debug.insert_kext: insert_kext example node
 $ dmesg | grep insert_kext
-hello from insert_kext (boot hook), slide=00000000...
-hello from insert_kext (sysctl), slide=00000000...
+hello from insert_kext (boot hook), slide=000000002ee78000
+hello from insert_kext (sysctl), slide=000000002ee78000
 ```
 
 **Check the build tag before believing anything.** A kext that only misbehaves
@@ -250,62 +252,92 @@ disagreements.
 ```
 
 gives the kext a real sysctl, readable with `sysctl debug.<name>`, whose
-handler is your `payload_sysctl`.
+handler is your `payload_sysctl`. Nothing is spliced for it: the kext calls
+the kernel's own `sysctl_register_oid` from `payload_main`, once, and the
+kernel does the rest.
 
-**The registration happens in the image, not at runtime, and that is not an
-optimisation.** A `struct sysctl_oid_list` is a singly linked list whose head
-lives next to the parent node, and every built-in parent node lives in
-`__DATA_CONST`, which is read-only once boot has finished. XNU gets away with
-calling `sysctl_register_oid` because every built-in OID is registered from a
-startup entry while `__DATA_CONST` is still writable, and because there is no
-third-party kext loading on iOS for anything to register afterwards. A kext
-hooked into ordinary running code is on the wrong side of that line. So
-`insert_kext` writes the OID into the kernelcache and points the parent's list
-head at it, exactly as the boot-time code would have left things.
+**Verified on hardware.** `sysctl debug.insert_kext` returns its value,
+repeatably; `sysctl -d` returns its description; and the handler logs to
+`dmesg` on every read.
 
-That turns out to be *checkable* in a way a runtime call would not be: the list
-head in a shipped kernelcache reads **zero**, because the lists really are
-built at boot. So the tool is not editing a structure, it is initialising an
-empty one — and if the head is not zero, this is not the image the config
-describes and the build stops.
+### Why it is done that way, which took two panics to learn
 
-Everything else is copied from a **reference OID the image already contains**,
-so the result has the shape of an OID this kernel already dispatches rather
-than one derived from a specification someone wrote down.
+The first version registered the OID **at build time** — wrote a
+`struct sysctl_oid` into `__DATA_CONST` and pointed the parent's list head at
+it — on the theory that a runtime call was impossible, because a
+`sysctl_oid_list` head lives next to its parent node in `__DATA_CONST`, which
+is read-only once boot has finished.
 
-The two pointer-authentication details, both read out of the kernel rather
-than assumed, because getting either wrong is a panic on first access:
+That theory is wrong, and XNU has the answer built in. The first entry in a
+node's children list can be an `__anchor__(_name)` OID with
+`oid_number == INT_MIN`, and `sysctl_register_oid_locked` then takes
+`anchor->oid_arg1` as a **second** children list. For `debug` that list is in
+`__DATA,__bss` — writable at runtime — and every `OID_AUTO` registration is
+routed there rather than into the `__DATA_CONST` head. Runtime registration
+was available all along.
 
-* `oid_parent` is signed with key **DA**, address-diversified, discriminator
-  **0xdb49** — which is what `sysctl_register_oid_locked` authenticates it
-  with.
-* `oid_handler` is signed with key **IA**, address-diversified, discriminator
-  `hash16(oid_arg1 >> 4)`. A shipped image stores it *unblended* (IA,
-  discriminator `0x0e2e`, no address diversity) because the boot-time
-  registration re-signs it in place. Nothing will re-sign ours, so it is
-  written already blended. Keeping `oid_arg1` NULL is not an accident: it
-  makes that hash zero, so the diversity is a constant and a chained fixup can
-  express it.
+The build-time version also did not work. It registered — `sysctl -N debug`
+listed the node — but reading it panicked:
 
-The OID and its strings go in the padding between the last section in
-`__DATA_CONST` and the end of the segment — 4560 bytes on T8150, covered by no
-section of any of the 302 fileset entries. `insert_kext` re-derives that
-containment on every run rather than trusting the config's note, and refuses a
-region that any section overlaps, that is not all zeros, or that is in a
-segment writable at runtime (a `CTLFLAG_PERMANENT` OID belongs in read-only
-memory, like every built-in one).
+```
+panic(cpu 3): PAC failure from kernel with IA key while branching to x23
+x22 = the OID, exactly where the build put it
+x19 = &oid->oid_handler with its top 16 bits cleared
+```
 
-Adding the OID's pointers means adding links to the image's chained-fixup
-chains, and that is the one place where plausible arithmetic silently stops a
-page of pointers from being rebased. `ikext/macho.py:chain_insert` re-walks
-the page afterwards and requires the result to be exactly the old chain plus
-the one new offset, in order.
+The pointer's target was right and the modifier the call site used was
+bit-for-bit what the build had assumed. The build had asked the chained-fixup
+loader to produce an address-blended `IA` signature by setting `addrDiv=1,
+diversity=0`, and what it produced was not what the CPU would authenticate —
+even though that exact encoding appears 24477 times in the stock image.
 
-**Status: verified statically, not yet on hardware.** Every byte decodes back
-correctly, every chain still walks, and the PAC fields match the kernel's own
-— but the sysctl path has not been booted. The hook path has.
+**The lesson is the design, not the diagnosis: do not ask a third party to
+produce a signature you could produce yourself.** The kext now signs the two
+pointers with `pacda` and `pacia`, executed by the CPU that will later
+authenticate them:
 
----
+| field | key | modifier |
+|---|---|---|
+| `oid_parent` | DA | `blend(&oid->oid_parent, 0xdb49)` — what `sysctl_register_oid_locked` authenticates it with |
+| `oid_handler` | IA | the constant `0x0e2e`, **no** address blend — the form a shipped image stores |
+
+and hands the OID to `sysctl_register_oid`, which re-signs the handler with the
+address blend exactly as it does for the kernel's own 60 `debug` OIDs. There is
+nothing left to get wrong that the kernel does not already get wrong for
+itself.
+
+This is the same discipline the `sysent` patcher in the tool this grew out of
+already had, and which the splice violated: **never construct PAC fields.**
+Copy them from a reference the image already contains, or have the CPU make
+them.
+
+### Two things the kernel will refuse
+
+Both cost a boot, and both are cheap to avoid:
+
+* **`CTLFLAG_PERMANENT` is not yours to set.** `sysctl_register_oid` panics
+  with *"Use sysctl_register_oid_early to register permanent nodes"*; permanent
+  nodes may only be registered from the startup path. Leaving it off is also
+  better: the kernel then `zalloc`s its own copy, so `sysctl_root`'s refcount
+  increment and the handler re-signing both land in writable memory.
+* **`CTLFLAG_OID2` and `oid_version == 1` are checked**, and `oid_number` must
+  be greater than `-2`, so `OID_AUTO` (`-1`) is the only sentinel it takes.
+
+### Registering at the right moment
+
+The hook fires during early boot — the panic above landed with *"OS release
+type: Not set yet"* — and at that point the parent's children list may still be
+empty, which is not merely early but the wrong shape: without the anchor there
+is no writable list to route an `OID_AUTO` registration into.
+
+So `ksysctl_register()` checks that the parent's list head is non-zero before
+doing anything, and returns without setting its one-shot guard if it is not.
+A shipped kernelcache leaves that head zero, so non-zero is exactly the signal
+that the kernel's own sysctls are up. The hook fires every few seconds forever,
+so the next firing simply tries again.
+
+The OID struct and the guard word live in the config's `scratch` region,
+because the kext's own memory is read-only.
 
 ## Command reference
 
