@@ -161,6 +161,62 @@ def props_set(props, name, value):
     return der_tlv(0xa0, der_tlv(0x30, inner))
 
 
+def props_retile_tail(props, payload_len, verbose=True):
+    """Give bytes appended to the payload an EXECUTABLE region, without
+    moving anything.
+
+    The six regions must tile the payload exactly, and only two of them are
+    executable: `kcxf/kcxz` (the main one, holding all the mapped code) and
+    `kcbf/kcbz` (the small boot-executable one).  Both are single contiguous
+    ranges, so the executable area cannot simply be extended over an append at
+    the end of the file -- `kcxz` sits in the MIDDLE of the layout, and growing
+    it there would shift every later region's file offset, and with it every
+    virtual address, since a segment's VA is rigidly `load_addr + fileoff`.
+    Nothing in a signed image can absorb that shift.
+
+    The way out is that the boot-executable region does not have to stay where
+    it is.  `kcbf/kcbz` abuts the end of `kcxf/kcxz`, so:
+
+        kcxz += kcbz            the main executable region absorbs it,
+                                which costs nothing: the bytes it swallows
+                                were executable already
+        kcbf, kcbz = tail       the freed descriptor is moved onto the append
+
+    The regions still tile the payload exactly, still sum to its length, and
+    not one byte of the image has moved.  The appended bytes end up in an
+    executable region with no relink.
+    """
+    d = props_get(props)
+    need = ("kcxf", "kcxz", "kcbf", "kcbz", "kclf", "kclz")
+    if not all(k in d for k in need):
+        raise SystemExit("properties element lacks the executable/boot region "
+                         "pairs; it carries: " + ", ".join(sorted(d)))
+    rx_end = d["kcxf"] + d["kcxz"]
+    if d["kcbf"] != rx_end:
+        raise SystemExit(
+            f"the boot-executable region starts at {d['kcbf']:#x}, not at the "
+            f"end of the executable region ({rx_end:#x}).  This re-tiling only "
+            "works when they abut.")
+    tail = max(d[f] + d[z] for f, z in
+               (("kcrf", "kcrz"), ("kcsf", "kcsz"), ("kcxf", "kcxz"),
+                ("kcbf", "kcbz"), ("kcwf", "kcwz"), ("kclf", "kclz"))
+               if f in d and z in d)
+    if payload_len <= tail:
+        raise SystemExit(f"payload is {payload_len} bytes and the regions "
+                         f"already reach {tail}; nothing was appended")
+    out = props_set(props, "kcxz", d["kcxz"] + d["kcbz"])
+    out = props_set(out, "kcbf", tail)
+    out = props_set(out, "kcbz", payload_len - tail)
+    if verbose:
+        print(f"\nre-tiled the region table for the appended {payload_len - tail} bytes")
+        print(f"  kcxz  {d['kcxz']:#x} -> {d['kcxz'] + d['kcbz']:#x}   "
+              f"executable region absorbs the boot-executable one")
+        print(f"  kcbf  {d['kcbf']:#x} -> {tail:#x}   boot-executable region "
+              "moves onto the appended tail")
+        print(f"  kcbz  {d['kcbz']:#x} -> {payload_len - tail:#x}")
+    return out
+
+
 # ---------------------------------------------------------- complzss -------
 
 def _decode_complzss(buf):

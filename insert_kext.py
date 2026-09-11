@@ -29,7 +29,7 @@ Design notes that matter if you port this:
 import argparse, json, os, re, secrets, shlex, struct, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ikext import image as imageio, sysent
+from ikext import fileset, image as imageio, sysent
 from ikext.macho import MachO, chained_fixups
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -250,7 +250,7 @@ def _link(cfg, srcs, base, tmp, tag, defines=None):
             seg["va"] + (lo - seg["foff"]))
 
 
-def build_blob(cfg, srcs, defines=None):
+def build_blob(cfg, srcs, defines=None, target=None):
     """Source -> raw blob, linked to sit exactly where it will be spliced.
 
     Three links.  The first is a probe, only to measure how far into __TEXT the
@@ -270,7 +270,7 @@ def build_blob(cfg, srcs, defines=None):
     by a non-page-multiple would break silently.  Linking directly at the
     target sidesteps that entirely.
     """
-    target = cfg["slack"]["va"]
+    target = cfg["slack"]["va"] if target is None else target
     PROBE = 0xfffffe0000000000
     with tempfile.TemporaryDirectory() as t:
         _, _, probe_base = _link(cfg, srcs, PROBE, t, "probe", defines)
@@ -415,24 +415,35 @@ def cmd_insert(cfg, img, args):
         defines = {"IK_SYSCTL_NAME": '"%s"' % args.sysctl,
                    "IK_SYSCTL_DESCR": '"%s"' % args.sysctl_descr,
                    "IK_SYSCTL_VALUE": str(args.sysctl_value)}
-    blob, meta = build_blob(cfg, srcs, defines)
-    print(f"kext:   {', '.join(os.path.basename(s) for s in srcs)}  "
-          f"{len(blob)} bytes, {slack['size'] - len(blob)} bytes of slack left")
-    if len(blob) > slack["size"]:
-        raise SystemExit("the kext does not fit the slack")
+    # Where the kext will live decides where it must be LINKED, so this has
+    # to be settled before the blob is built.  Appending does not disturb any
+    # existing offset, so the destination address is known from the current
+    # image length alone.
+    append = args.append_kext
+    if append:
+        exec_va = base + len(img["raw"]) + fileset.PAGE
+        blob, meta = build_blob(cfg, srcs, defines, target=exec_va)
+        print(f"kext:   {', '.join(os.path.basename(s) for s in srcs)}  "
+              f"{len(blob)} bytes, appended as {append!r} (no size ceiling)")
+    else:
+        blob, meta = build_blob(cfg, srcs, defines)
+        print(f"kext:   {', '.join(os.path.basename(s) for s in srcs)}  "
+              f"{len(blob)} bytes, {slack['size'] - len(blob)} bytes of slack left")
+        if len(blob) > slack["size"]:
+            raise SystemExit("the kext does not fit the slack")
 
     # 1. Refuse to write over anything.  The slack must still be all zeros, and
     #    the bytes immediately before it must still be the live code the config
     #    says is there -- the cheapest check that this is the image the config
     #    was written for.
     dst = slack["file_off"]
-    guard = slack.get("preceded_by")
+    guard = None if append else slack.get("preceded_by")
     if guard:
         n = len(guard) // 2
         have = bytes(d[dst - n:dst]).hex()
         if have != guard:
             raise SystemExit(f"bytes before the slack are {have}, config says {guard}")
-    if bytes(d[dst:dst + len(blob)]).strip(b"\0"):
+    if not append and bytes(d[dst:dst + len(blob)]).strip(b"\0"):
         raise SystemExit(f"destination {dst:#x} is not all zeros")
 
     # 2. The tail instruction -- or, for a detour, _kp_orig and a tail that
@@ -476,8 +487,9 @@ def cmd_insert(cfg, img, args):
         print(f"  tail:     {tail}")
 
     assert_no_trap_placeholder(blob, meta["base"])
-    d[dst:dst + len(blob)] = blob
-    print(f"  {dst:#09x}  {len(blob)} bytes  kext (entry {meta['entry']:#x})")
+    if not append:
+        d[dst:dst + len(blob)] = blob
+        print(f"  {dst:#09x}  {len(blob)} bytes  kext (entry {meta['entry']:#x})")
 
     # 3. Hooks: rewrite each named call site to reach the entry point.
     for name in args.hook:
@@ -598,6 +610,23 @@ def cmd_insert(cfg, img, args):
                        else 0x4B450000 + a0),
         }
 
+    # 7. The appended entry itself.  This happens LAST, after every patch to
+    #    the existing image, because it appends to the end of `d` and rewrites
+    #    the header's command count -- and because the hook edits above have to
+    #    land in the image the entry is then measured against.
+    if append:
+        newd, geom = fileset.emit_entry(bytes(d), append, code=bytes(blob),
+                                        data_size=args.append_data_size)
+        if geom["exec_va"] != meta["base"]:
+            raise SystemExit(f"the entry's __TEXT_EXEC landed at "
+                             f"{geom['exec_va']:#x} but the kext was linked for "
+                             f"{meta['base']:#x}")
+        d = bytearray(newd)
+        print()
+        if not fileset.check(bytes(d), label="the emitted image", verbose=False):
+            raise SystemExit("the emitted image fails its own layout checks")
+        expect["append"] = geom
+
     out = args.out or "kernelcache.insert_kext.im4p"
     raw_out = os.path.splitext(out)[0] + ".raw"
     open(raw_out, "wb").write(bytes(d))
@@ -608,7 +637,7 @@ def cmd_insert(cfg, img, args):
               "image was written.  Re-run with the .ipsw or the IM4P as <image>, "
               "or pass --stock-im4p.")
         return
-    package(cfg, img, bytes(d), out)
+    package(cfg, img, bytes(d), out, cover=getattr(args, "append_cover", "exec"))
     if tag:
         open(out + ".uname", "w").write(tag + "\n")
     json.dump(expect, open(out + ".expect.json", "w"), indent=2)
@@ -688,7 +717,7 @@ def cmd_verify(cfg, img, args):
 
 # --------------------------------------------------------------- package ----
 
-def package(cfg, img, payload, out):
+def package(cfg, img, payload, out, cover="exec"):
     """Wrap a patched image as an UNCOMPRESSED IM4P, keeping the stock image's
     properties element.
 
@@ -700,6 +729,16 @@ def package(cfg, img, payload, out):
     rather than regenerated.
     """
     tlv, props = imageio.der_tlv, img["props"]
+    if len(payload) > len(img["raw"]):
+        if cover == "readonly":
+            d = imageio.props_get(props)
+            grew = len(payload) - (d["kclf"] + d["kclz"])
+            props = imageio.props_set(props, "kclz", d["kclz"] + grew)
+            print(f"\ncovered the appended {grew} bytes by growing the last "
+                  f"region: kclz {d['kclz']} -> {d['kclz'] + grew} "
+                  "(mapped, NOT executable)")
+        else:
+            props = imageio.props_retile_tail(props, len(payload))
     body = (tlv(0x16, b"IM4P") + tlv(0x16, img["type"].encode())
             + tlv(0x16, img["version"].encode()) + tlv(0x04, payload) + props)
     open(out, "wb").write(tlv(0x30, body))
@@ -1010,6 +1049,21 @@ def main():
     p = sub.add_parser("insert", help="the whole pipeline")
     p.add_argument("image")
     p.add_argument("-o", "--out", help="output IM4P (default kernelcache.insert_kext.im4p)")
+    p.add_argument("--append-kext", metavar="BUNDLE_ID",
+                   help="put the kext in a NEW fileset entry appended to the "
+                        "end of the image, instead of in existing slack.  Adds "
+                        "a real named bundle with no size ceiling, and re-tiles "
+                        "the IM4P region table so the appended code is "
+                        "executable.  Nothing already in the image moves")
+    p.add_argument("--append-cover", choices=("exec", "readonly"), default="exec",
+                   metavar="MODE",
+                   help="how the appended bytes get covered by the IM4P region "
+                        "table.  'exec' re-tiles so they land in an executable "
+                        "region; 'readonly' simply grows the last region over "
+                        "them, which maps them but not executably")
+    p.add_argument("--append-data-size", type=lambda x: int(x, 0), default=0x4000,
+                   metavar="N", help="__DATA bytes for the appended entry "
+                                     "(default 0x4000)")
     p.add_argument("--kext", action="append",
                    help="kext source; repeatable.  Default: kext/hello.c")
     p.add_argument("--hook", action="append", default=[],
