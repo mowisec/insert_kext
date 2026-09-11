@@ -72,6 +72,39 @@ segments — at the end of the image. **Nothing that already exists moves**
 either: the entry's header goes in new bytes at the end and the three new load
 commands go in the header's zero padding.
 
+```bash
+insert_kext.py --variant kernelcache.research.v57 \
+    insert iPhone18,3_27.0_24A5424a_Restore.ipsw \
+    --append-kext com.apple.testinject --prelink-bundle \
+    --hook oslog_extensible_paniclog \
+    --sysctl insert_kext --sysctl-value 42 \
+    -o hello.im4p
+```
+
+```
+kext:   hello.c  1874 bytes, 14502 bytes of slack left  appended as 'com.apple.testinject', code in the slack
+  25 sites  hook 'oslog_extensible_paniclog' -> 0xfffffe000b36c008
+
+appended fileset entry 'com.apple.testinject'
+  __KEXT_EXEC    va 0xfffffe000b9b8000  fo 0x49b4000  16384 bytes  r-x
+  __TEXT_EXEC  va 0xfffffe000b36c008  fo 0x4368008  1874 bytes  <- the code
+  ncmds 315 -> 317, file 77283328 -> 77299712 (+16384)
+
+== the emitted image  (77299712 bytes)
+  19 checks passed, 0 failed
+
+__PRELINK_INFO: added bundle 'com.apple.testinject'
+  320 -> 321 bundles, plist 2558342 -> 2559725 bytes, 12563 bytes of padding left
+
+covered the appended 16384 bytes by growing the last region: kclz 802816 -> 819200
+```
+
+Note where the two halves land: the entry's **header** is appended, and its
+**code** is in the slack, because appended bytes cannot be made executable —
+see below. `--prelink-bundle` additionally registers it in `__PRELINK_INFO`.
+Everything else is as for slack injection, so `--sysctl`, `--syscall-slot`,
+`--detour` and the rest all still apply.
+
 | | slack injection | `--append-kext` |
 |---|---|---|
 | your code runs in the kernel | yes | yes |
