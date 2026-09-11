@@ -420,18 +420,23 @@ def cmd_insert(cfg, img, args):
     # existing offset, so the destination address is known from the current
     # image length alone.
     append = args.append_kext
+    in_slack = append and args.append_exec == "slack"
     absorb = None
+    if args.prelink_bundle and not append:
+        raise SystemExit("--prelink-bundle only makes sense with --append-kext")
     if args.absorb_boot_exec and not append:
         raise SystemExit("--absorb-boot-exec only makes sense with --append-kext")
-    if append:
+    if append and not in_slack:
         exec_va = base + len(img["raw"]) + fileset.PAGE
         blob, meta = build_blob(cfg, srcs, defines, target=exec_va)
         print(f"kext:   {', '.join(os.path.basename(s) for s in srcs)}  "
               f"{len(blob)} bytes, appended as {append!r} (no size ceiling)")
     else:
         blob, meta = build_blob(cfg, srcs, defines)
+        where = f"appended as {append!r}, code in the slack" if in_slack else ""
         print(f"kext:   {', '.join(os.path.basename(s) for s in srcs)}  "
-              f"{len(blob)} bytes, {slack['size'] - len(blob)} bytes of slack left")
+              f"{len(blob)} bytes, {slack['size'] - len(blob)} bytes of slack "
+              f"left  {where}")
         if len(blob) > slack["size"]:
             raise SystemExit("the kext does not fit the slack")
 
@@ -440,13 +445,13 @@ def cmd_insert(cfg, img, args):
     #    says is there -- the cheapest check that this is the image the config
     #    was written for.
     dst = slack["file_off"]
-    guard = None if append else slack.get("preceded_by")
+    guard = slack.get("preceded_by") if (in_slack or not append) else None
     if guard:
         n = len(guard) // 2
         have = bytes(d[dst - n:dst]).hex()
         if have != guard:
             raise SystemExit(f"bytes before the slack are {have}, config says {guard}")
-    if not append and bytes(d[dst:dst + len(blob)]).strip(b"\0"):
+    if (in_slack or not append) and bytes(d[dst:dst + len(blob)]).strip(b"\0"):
         raise SystemExit(f"destination {dst:#x} is not all zeros")
 
     # 2. The tail instruction -- or, for a detour, _kp_orig and a tail that
@@ -490,7 +495,7 @@ def cmd_insert(cfg, img, args):
         print(f"  tail:     {tail}")
 
     assert_no_trap_placeholder(blob, meta["base"])
-    if not append:
+    if in_slack or not append:
         d[dst:dst + len(blob)] = blob
         print(f"  {dst:#09x}  {len(blob)} bytes  kext (entry {meta['entry']:#x})")
 
@@ -620,7 +625,9 @@ def cmd_insert(cfg, img, args):
     if append:
         newd, geom = fileset.emit_entry(bytes(d), append, code=bytes(blob),
                                         data_size=args.append_data_size,
-                                        top_level=not args.absorb_boot_exec)
+                                        top_level=not args.absorb_boot_exec,
+                                        exec_at=((slack["file_off"], slack["va"],
+                                                  len(blob)) if in_slack else None))
         if geom["exec_va"] != meta["base"]:
             raise SystemExit(f"the entry's __TEXT_EXEC landed at "
                              f"{geom['exec_va']:#x} but the kext was linked for "
@@ -631,6 +638,9 @@ def cmd_insert(cfg, img, args):
         print()
         if not fileset.check(bytes(d), label="the emitted image", verbose=False):
             raise SystemExit("the emitted image fails its own layout checks")
+        if args.prelink_bundle:
+            d = bytearray(fileset.add_prelink_bundle(bytes(d), append))
+            expect["prelink_bundle"] = append
         expect["append"] = geom
 
     out = args.out or "kernelcache.insert_kext.im4p"
@@ -1121,6 +1131,18 @@ def main():
                         "a real named bundle with no size ceiling, and re-tiles "
                         "the IM4P region table so the appended code is "
                         "executable.  Nothing already in the image moves")
+    p.add_argument("--prelink-bundle", action="store_true",
+                   help="also add a __PRELINK_INFO bundle dictionary for the "
+                        "appended kext, so the kernel's extension registry "
+                        "knows it exists.  Codeless, which is what the vendor's "
+                        "own pseudo-extensions use")
+    p.add_argument("--append-exec", choices=("appended", "slack"),
+                   default="appended", metavar="WHERE",
+                   help="where the appended entry's code lives.  'appended' "
+                        "puts it in the new bytes at the end of the image; "
+                        "'slack' puts it in the configured slack, which is "
+                        "already inside an executable region, so no region "
+                        "size has to change")
     p.add_argument("--absorb-boot-exec", action="store_true",
                    help="edit the SEGMENT TABLE as well: grow __TEXT_EXEC over "
                         "__TEXT_BOOT_EXEC (contiguous in file and VA) and "
