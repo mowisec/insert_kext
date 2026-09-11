@@ -27,6 +27,13 @@
 #include "ksysctl.h"
 #include "ksyscall.h"
 
+#ifndef IK_IOREG_KEY
+#define IK_IOREG_KEY   "insert_kext"
+#endif
+#ifndef IK_IOREG_VALUE
+#define IK_IOREG_VALUE "hello"
+#endif
+
 void
 payload_main(uint64_t a0, uint64_t a1, uint64_t a2,
     uint64_t a3, uint64_t a4, uint64_t a5)
@@ -63,6 +70,54 @@ payload_main(uint64_t a0, uint64_t a1, uint64_t a2,
 }
 
 /*
+ * Publishing a property into the IO registry, so the injected kext is visible
+ * to `ioreg` and not only to `sysctl`.
+ *
+ * WHY FROM THE SYSCTL HANDLER AND NOT FROM payload_main.  The hook fires
+ * during early boot, and the registry root does not exist until IOKit has been
+ * initialised.  A sysctl read happens when userspace asks, which is long after
+ * that, so calling from here removes the timing question entirely instead of
+ * guessing where in the boot the hook sits.
+ *
+ * WHY setProperty(const char *, const char *) AND NOT A C++ CLASS.  Defining
+ * an IOService subclass would mean building a vtable, and on arm64e vtable
+ * entries are signed pointers: constructing one by hand is exactly the mistake
+ * that kext/include/ksysctl.h documents at length.  Calling two existing,
+ * non-virtual kernel functions constructs nothing -- every pointer involved
+ * was signed by the kernel that owns it.
+ *
+ * Both addresses must be in the config's symbol map, so this compiles away
+ * entirely on an image where they are not known.
+ */
+static void
+ik_publish_ioreg_property(void)
+{
+#if defined(KADDR_IORegistryEntry_getRegistryRoot) && \
+    defined(KADDR_IORegistryEntry_setProperty_cstr)
+	static const uint64_t MARK = 0x494b494f524547ULL;       /* "IKIOREG" */
+	volatile uint64_t *once = (volatile uint64_t *)
+	    ((char *)kp_addr(KADDR_scratch) + 16);
+	void *root;
+
+	if (*once == MARK)
+		return;
+
+	root = KP_CALL(void *, KADDR_IORegistryEntry_getRegistryRoot, void)();
+	if (root == 0) {
+		klog_err("insert_kext (ioreg): no registry root yet");
+		return;
+	}
+	KP_CALL(int, KADDR_IORegistryEntry_setProperty_cstr,
+	    void *, const char *, const char *)(root, IK_IOREG_KEY,
+	    IK_IOREG_VALUE);
+
+	*once = MARK;
+	klog_err("insert_kext (ioreg): set %s on the registry root %p",
+	    IK_IOREG_KEY, root);
+#endif
+}
+
+/*
  * Reached through _kp_sysctl_entry, which supplies the BTI landing pad the
  * kernel's authenticated indirect call requires.  Logging here is not noise:
  * it happens once per read, when somebody asked.
@@ -71,6 +126,8 @@ KSYSCTL_HANDLER(payload_sysctl)
 {
 	klog_err("hello from insert_kext (sysctl), slide=" KLOG_ADDR_FMT,
 	    KLOG_ADDR(kp_slide()));
+
+	ik_publish_ioreg_property();
 
 	return ksysctl_handle_int(oidp, arg1, arg2, req);
 }
