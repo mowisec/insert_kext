@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.im4p
+*.raw
+*.uname
+*.bin
+build/
+work/

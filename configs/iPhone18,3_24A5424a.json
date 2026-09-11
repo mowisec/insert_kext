@@ -1,0 +1,94 @@
+{
+  "name": "iPhone18,3 (V57AP, T8150) / iOS 27.0 24A5424a / kernelcache.research.v57",
+  "identify": {
+    "_note": "sha256 is of the DECOMPRESSED kernelcache, which is what insert_kext hashes to pick a config. `marker` is the fallback: it identifies the kernel build but not the exact image, so a marker-only match prints a warning and every address below should be re-derived before it is trusted.",
+    "sha256": "c074e3fb2e2271204082f5ec9425a54b7e40f880b231dd6599ae79b7a312654a",
+    "marker": "RELEASE_ARM64_T8150"
+  },
+  "map_base": "0xfffffe0007004000",
+  "slack": {
+    "_note": "The 0x3ff8 of zeros at the end of __TEXT_EXEC is the com.apple.kernel fileset entry's __LAST segment, 0xfffffe000b36c000 + 0x4000, whose first 8 bytes are live code (msr SPSel,#1 ; ret) -- which is why the region starts at ...008 and why the size is identical across devices: it is a named, allocated segment, not incidental padding. r-x at runtime, so code runs there and nothing can be written to it.",
+    "segment": "__TEXT_EXEC",
+    "file_off": "0x4368008",
+    "va": "0xfffffe000b36c008",
+    "size": 16376,
+    "preceded_by": "bf4100d5c0035fd6"
+  },
+  "build_tag": {
+    "_note": "Both copies of the kernel version string carry a 19-character configuration field. Replacing it in place, at the same length, makes `uname -a` name exactly which image booted. The tag is RANDOM per build: two builds that happen to be byte-identical should still be distinguishable in a log.",
+    "stock": "RELEASE_ARM64_T8150",
+    "prefix": "IK",
+    "count": 2
+  },
+  "symbols": {
+    "_os_log_internal": "0xfffffe000b1d48b4",
+    "os_log_dso": "0xfffffe000700c000",
+    "os_log_default": "0xfffffe000b6e3360",
+    "panic": "0xfffffe000b34b5b8",
+    "copyin": "0xfffffe000ac6cbe8",
+    "copyout": "0xfffffe000ac6e280",
+    "copyinstr": "0xfffffe000ac6dfc0",
+    "PE_parse_boot_argn": "0xfffffe000b3131ec",
+    "sysctl_handle_int": "0xfffffe000b036b24"
+  },
+  "symbols_note": "iOS kernelcaches export essentially nothing, so every entry here was recovered by hand. See README.md, 'Porting to another kernelcache'.",
+  "hooks": {
+    "oslog_extensible_paniclog": {
+      "_note": "The 25 non-panic-path `BL _os_log_internal` sites that log 'Extensible paniclog not supported'. That message is emitted about every 3 s on this device, so the hook is known to fire, and the context is known safe for os_log because it was already calling it. The 26th site, 0xfffffe000b34b658, is in the panic path and is deliberately excluded.",
+      "expect_target": "0xfffffe000b1d48b4",
+      "sites": [
+        "0xfffffe000aaadf00",
+        "0xfffffe000aaadf38",
+        "0xfffffe000aaadf6c",
+        "0xfffffe000aaadfa4",
+        "0xfffffe000aaadfdc",
+        "0xfffffe000aaae014",
+        "0xfffffe000aaae04c",
+        "0xfffffe000aaae084",
+        "0xfffffe000aaae0bc",
+        "0xfffffe000aaae0f4",
+        "0xfffffe000b1eae1c",
+        "0xfffffe000b1eae80",
+        "0xfffffe000b1eaee8",
+        "0xfffffe000b1eb028",
+        "0xfffffe000b1eb0b8",
+        "0xfffffe000b1eb130",
+        "0xfffffe000b292994",
+        "0xfffffe000b293058",
+        "0xfffffe000b293114",
+        "0xfffffe000b29314c",
+        "0xfffffe000b293184",
+        "0xfffffe000b2931bc",
+        "0xfffffe000b2931f4",
+        "0xfffffe000b29322c",
+        "0xfffffe000b29343c"
+      ],
+      "default_tail": "branch:0xfffffe000b1d48b4"
+    }
+  },
+  "sysctl": {
+    "_note": "Everything here was read out of THIS kernel; see ikext/ksysctl.py for what each field means and why the registration is done in the image. `parent_children` is &sysctl__debug_children, taken from the `debug` node's oid_arg1, and it reads 0 in a shipped image because the lists are built at boot.",
+    "parent_path": "debug",
+    "parent_children": "0xfffffe0007ec7758",
+    "reference_oid": "0xfffffe0007e734a0",
+    "oid_number": 1,
+    "oid_version": 1,
+    "oid_kind": "0x80e00002",
+    "oid_parent_pac": {
+      "key": 2,
+      "diversity": "0xdb49",
+      "addr_div": 1
+    },
+    "oid_handler_pac": {
+      "key": 0,
+      "diversity": 0,
+      "addr_div": 1
+    },
+    "region": {
+      "_note": "The padding between the last section in __DATA_CONST (com.apple.filesystems.tmpfs __DATA_CONST,__got, ending 0xfffffe0008412e30) and the end of the segment. 4560 bytes, all zero, covered by no section of any of the 302 fileset entries -- insert_kext re-derives that containment on every run rather than trusting this note. Read-only at runtime, which is where a CTLFLAG_PERMANENT OID belongs.",
+      "foff": "0x140ee30",
+      "va": "0xfffffe0008412e30",
+      "size": 4560
+    }
+  }
+}
