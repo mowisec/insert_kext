@@ -421,9 +421,28 @@ def cmd_insert(cfg, img, args):
     # image length alone.
     append = args.append_kext
     in_slack = append and args.append_exec == "slack"
+    if in_slack and args.append_data_size:
+        # In slack mode only the entry's header page is appended, so a
+        # non-zero __DATA would sit past the end of the image and fail the
+        # containment invariant.  The kext cannot have writable data anyway --
+        # the linker refuses any non-__TEXT segment -- so this is a correction,
+        # not a restriction.
+        print(f"note: --append-data-size {args.append_data_size} ignored; an "
+              "entry whose code is in the slack has no appended data segment")
+        args.append_data_size = 0
     absorb = None
     if args.prelink_bundle and not append:
         raise SystemExit("--prelink-bundle only makes sense with --append-kext")
+    if append and (args.append_exec == "appended"
+                   or args.append_cover != "readonly"):
+        print("WARNING: --append-exec appended and every --append-cover other "
+              "than 'readonly' are UNVERIFIED.\n"
+              "         Appended bytes can be mapped but not made executable, "
+              "and every attempt to\n"
+              "         resize or relocate an executable region has been "
+              "refused before the kernel ran.\n"
+              "         Expect a refusal to boot, or an instruction-fetch "
+              "fault on the first call.")
     if args.absorb_boot_exec and not append:
         raise SystemExit("--absorb-boot-exec only makes sense with --append-kext")
     if append and not in_slack:
@@ -1205,7 +1224,7 @@ def main():
                         "knows it exists.  Codeless, which is what the vendor's "
                         "own pseudo-extensions use")
     p.add_argument("--append-exec", choices=("appended", "slack"),
-                   default="appended", metavar="WHERE",
+                   default="slack", metavar="WHERE",
                    help="where the appended entry's code lives.  'appended' "
                         "puts it in the new bytes at the end of the image; "
                         "'slack' puts it in the configured slack, which is "
@@ -1218,7 +1237,7 @@ def main():
                         "and removes no load command")
     p.add_argument("--append-cover",
                    choices=("exec", "exec-extend", "readonly", "boot-exec"),
-                   default="exec",
+                   default="readonly",
                    metavar="MODE",
                    help="how the appended bytes get covered by the IM4P region "
                         "table.  'readonly' grows the last region over them, "

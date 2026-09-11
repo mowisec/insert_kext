@@ -397,6 +397,21 @@ because the kext's own memory is read-only.
 | `check <image>` | ask a booted device whether the image did what `insert` said it would |
 | `selftest <image>` | the detour classifier against `llvm-objdump` |
 
+**Global flags go before the subcommand, everything else after it.**
+`--config`, `--variant`, `--stock-im4p` and `--set-prop` belong to the program;
+`--append-kext`, `--hook`, `--sysctl` and the rest belong to `insert`. Putting
+a subcommand flag first gets you `invalid choice: 'com.apple.example'`, because
+argparse reads its value as the subcommand name:
+
+```bash
+insert_kext.py --variant kernelcache.research.v57 \
+    insert iPhone18,3_27.0_24A5424a_Restore.ipsw \
+    --append-kext com.apple.testinject --prelink-bundle \
+    --hook oslog_extensible_paniclog \
+    --sysctl insert_kext --sysctl-value 42 \
+    -o hello.im4p
+```
+
 Global options: `--config` (auto-selected by content if omitted), `--variant`
 (which kernelcache to take out of an `.ipsw`), `--stock-im4p` (where to get the
 IM4P properties element when the input is a bare Mach-O), `--set-prop
@@ -405,9 +420,12 @@ NAME=VALUE` (rewrite one `kc*` property before packaging).
 `insert` options for an appended entry: `--append-kext <bundle id>`,
 `--append-exec slack|appended`, `--append-data-size N`, `--append-cover
 readonly|exec|exec-extend|boot-exec`, `--prelink-bundle`, `--absorb-boot-exec`.
-Only `--append-cover readonly` is known to load; the others exist because the
-question of which region shapes the loader accepts is worth being able to ask,
-and their docstrings say plainly that they are unverified.
+
+**The defaults are the shapes that are known to work** — `--append-exec slack`
+and `--append-cover readonly` — so `--append-kext <id>` on its own is the right
+command. The others exist because which region shapes the loader accepts is
+worth being able to ask, they print a warning when selected, and their
+docstrings say plainly that they are unverified.
 
 Every write asserts what it is overwriting first: the slack must still be all
 zeros, the bytes before it must still match `preceded_by`, a hooked instruction
