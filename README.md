@@ -429,4 +429,4 @@ configs/              one JSON per kernelcache
 
 ## Licence
 
-MIT. See `LICENSE`.
+Apache 2.0. See `LICENSE`.
