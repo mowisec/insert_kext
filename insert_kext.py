@@ -647,6 +647,41 @@ def report_diff(a, b, base, gap=16):
         print(f"  file {lo:#09x}  VA {base+lo:#x}  {n} bytes{note}")
 
 
+def cmd_package(cfg, img, args):
+    """Re-wrap a Mach-O that was patched elsewhere, or re-wrap an IM4P after
+    --set-prop.  `insert` packages its own output; this is for the cases where
+    the image and its wrapper are edited in separate steps."""
+    if img["props"] is None:
+        raise SystemExit("no properties element; pass --stock-im4p")
+    package(cfg, img, img["raw"], args.out)
+
+
+def cmd_props(cfg, img, args):
+    """Print the kc* properties, and check that the regions still partition
+    the payload exactly -- which is the invariant an image that grew breaks."""
+    if img["props"] is None:
+        raise SystemExit("no IM4P properties element (bare Mach-O input)")
+    d = imageio.props_get(img["props"])
+    for k in sorted(d):
+        print(f"  {k:<5} {d[k]:#x}  {d[k]}")
+    pairs = [("kcrf", "kcrz"), ("kcsf", "kcsz"), ("kcxf", "kcxz"),
+             ("kcbf", "kcbz"), ("kcwf", "kcwz"), ("kclf", "kclz")]
+    if not all(f in d and z in d for f, z in pairs):
+        return
+    print("\nprotection regions:")
+    for f, z in pairs:
+        print(f"  {f[2:]:<3} [{d[f]:#011x}, {d[f] + d[z]:#011x})  {d[z]} bytes")
+    total = sum(d[z] for _, z in pairs)
+    have = len(img["raw"])
+    print(f"\n  regions sum to {total}, payload is {have}", end="")
+    if total == have:
+        print("  -- exact, as iBoot expects")
+    else:
+        print(f"  -- MISMATCH, {have - total} bytes outside every region.\n"
+              f"  the last region would have to be kclz={d['kclz'] + have - total} "
+              "to cover them")
+
+
 def cmd_verify(cfg, img, args):
     report_diff(img["raw"], open(args.patched, "rb").read(), cfg["map_base"])
 
@@ -940,10 +975,18 @@ def main():
     ap.add_argument("--stock-im4p", help="take the IM4P properties element from "
                                          "here instead (needed to package a bare "
                                          "Mach-O input)")
+    ap.add_argument("--set-prop", action="append", default=[], metavar="NAME=VALUE",
+                    help="rewrite one kc* IM4P property before packaging, e.g. "
+                         "kclz=851968.  Repeatable.  See the `props` subcommand "
+                         "for what an image currently carries")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    for name in ("info",):
+    for name in ("info", "props"):
         sub.add_parser(name).add_argument("image")
+    p = sub.add_parser("package", help="wrap an already-patched Mach-O as a "
+                                       "bootable uncompressed IM4P")
+    p.add_argument("image", help="the patched Mach-O (or an IM4P to re-wrap)")
+    p.add_argument("-o", "--out", required=True)
     p = sub.add_parser("slack"); p.add_argument("image")
     p.add_argument("--min", type=int, default=256)
     p = sub.add_parser("build"); p.add_argument("image")
@@ -1016,7 +1059,20 @@ def main():
         r = cmd_check(None, None, args)
     else:
         img = imageio.load(args.image, args.variant, args.stock_im4p)
-        cfg = pick_config(img, args.config)
+        for spec in args.set_prop:
+            if "=" not in spec:
+                raise SystemExit(f"--set-prop wants NAME=VALUE, got {spec!r}")
+            k, v = spec.split("=", 1)
+            if img["props"] is None:
+                raise SystemExit("--set-prop needs an IM4P; pass one as <image> "
+                                 "or with --stock-im4p")
+            was = imageio.props_get(img["props"]).get(k)
+            img["props"] = imageio.props_set(img["props"], k, int(v, 0))
+            print(f"--set-prop {k}: {was} -> {int(v, 0)}")
+        # `props` reads only the IM4P wrapper, so it must work on a patched
+        # image, which by definition no config's checksum matches.
+        cfg = (None if args.cmd in ("props", "package")
+               else pick_config(img, args.config))
         r = globals()["cmd_" + args.cmd](cfg, img, args)
     if r is False:
         sys.exit(1)

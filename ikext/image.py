@@ -72,6 +72,95 @@ def im4p_parts(im4p):
     return out
 
 
+# ------------------------------------------------------- kc* properties ----
+#
+# The properties element (DER tag 0xa0) is what iBoot reads to learn how to
+# map the payload.  Its shape is
+#
+#     [0] { SEQUENCE { IA5String "PAYP", SET { entry, entry, ... } } }
+#     entry := <private tag> { SEQUENCE { IA5String "kclz", INTEGER 802816 } }
+#
+# and for a kernelcache the entries are six offset/size pairs -- kcrf/kcrz,
+# kcsf/kcsz, kcxf/kcxz, kcbf/kcbz, kcwf/kcwz, kclf/kclz -- that partition the
+# payload into back-to-back protection regions summing to EXACTLY the payload
+# length, plus kclo (the base VA) and kcep (the entry point).
+#
+# So an image whose payload grew has bytes outside every region iBoot knows
+# about, and the sizes have to be told about them.  `props_set` rewrites one
+# entry, leaving every other entry's bytes exactly as Apple encoded them and
+# recomputing only the constructed lengths above it.
+
+
+def _tag_end(b, i):
+    """Index just past a possibly multi-byte DER tag starting at `i`."""
+    j = i + 1
+    if b[i] & 0x1f == 0x1f:
+        while b[j] & 0x80:
+            j += 1
+        j += 1
+    return j
+
+
+def _tlv(b, i):
+    """-> (tag_bytes, content, next_index) for the DER TLV at `i`."""
+    t = _tag_end(b, i)
+    dl, j = der_len(b, t)
+    return b[i:t], b[j:j + dl], j + dl
+
+
+def _der_int(n):
+    if n < 0:
+        raise ValueError("negative property values are not supported")
+    e = n.to_bytes(max(1, (n.bit_length() + 8) // 8), "big")
+    return der_tlv(0x02, e)
+
+
+def _props_entries(props):
+    """-> (payp_name, [(tag_bytes, name, value, raw_entry), ...])"""
+    tag, c0, _ = _tlv(props, 0)
+    if tag != b"\xa0":
+        raise SystemExit("properties element does not start with DER tag 0xa0")
+    _, c1, _ = _tlv(c0, 0)                    # the SEQUENCE
+    _, payp, i = _tlv(c1, 0)                  # IA5String "PAYP"
+    _, c2, _ = _tlv(c1, i)                    # the SET of entries
+    out, i = [], 0
+    while i < len(c2):
+        etag, ec, j = _tlv(c2, i)
+        raw = c2[i:j]
+        _, seq, _ = _tlv(ec, 0)
+        _, nm, k = _tlv(seq, 0)
+        _, val, _ = _tlv(seq, k)
+        out.append((etag, nm.decode(), int.from_bytes(val, "big"), raw))
+        i = j
+    return payp, out
+
+
+def props_get(props):
+    """-> {name: int} for every kc* property in the element."""
+    _, entries = _props_entries(props)
+    return {nm: v for _, nm, v, _ in entries}
+
+
+def props_set(props, name, value):
+    """-> a new properties element with `name` set to `value`.
+
+    Every other entry keeps its original bytes; only the lengths of the
+    structures containing the edited entry are recomputed.
+    """
+    payp, entries = _props_entries(props)
+    if not any(nm == name for _, nm, _, _ in entries):
+        raise SystemExit(f"properties element has no {name!r}; it has: "
+                         + ", ".join(nm for _, nm, _, _ in entries))
+    body = b""
+    for etag, nm, _v, raw in entries:
+        if nm == name:
+            seq = der_tlv(0x30, der_tlv(0x16, nm.encode()) + _der_int(value))
+            raw = etag + der_wr_len(len(seq)) + seq
+        body += raw
+    inner = der_tlv(0x16, payp) + der_tlv(0x31, body)
+    return der_tlv(0xa0, der_tlv(0x30, inner))
+
+
 # ---------------------------------------------------------- complzss -------
 
 def _decode_complzss(buf):
