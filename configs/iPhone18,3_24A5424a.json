@@ -34,7 +34,13 @@
     "sysctl_parent_children": "0xfffffe0007ec7758",
     "scratch": "0xfffffe000b6f0000",
     "IORegistryEntry_getRegistryRoot": "0xfffffe000b208070",
-    "IORegistryEntry_setProperty_cstr": "0xfffffe000b2054e8"
+    "IORegistryEntry_setProperty_cstr": "0xfffffe000b2054e8",
+    "OSMetaClass_allocClassWithName": "0xfffffe000b18ba38",
+    "IOService_init": "0xfffffe000b21c364",
+    "IORegistryEntry_setName_cstr": "0xfffffe000b201608",
+    "IOService_getServiceRoot": "0xfffffe000b22517c",
+    "IOService_attach": "0xfffffe000b211bb8",
+    "IOService_registerService": "0xfffffe000b214b0c"
   },
   "symbols_note": "iOS kernelcaches export essentially nothing, so every entry here was recovered by hand.  See README.md, 'Porting to another kernelcache'.\nsysctl_parent_children is &sysctl__debug_children, read out of the `debug` node's oid_arg1.  It reads 0 in a shipped image: the lists are built at boot.\nscratch is WRITABLE kernel memory the kext needs for its one-shot guard and its sysctl_oid, because the kext's own memory is read-only.  0xfffffe000b6f0000 is inside a 0x40000-byte run of com.apple.kernel __DATA that was still zero a minute into boot, and a write there read back correctly and was restored.  CAVEAT: zero at t=60s is not proof the region is unowned -- it could be a buffer something fills in later -- so re-verify on a new image rather than inheriting this address.",
   "hooks": {

@@ -33,6 +33,12 @@
 #ifndef IK_IOREG_VALUE
 #define IK_IOREG_VALUE "hello"
 #endif
+#ifndef IK_IOREG_NODE
+#define IK_IOREG_NODE  "insert_kext"
+#endif
+#ifndef IK_IOREG_CLASS
+#define IK_IOREG_CLASS "IOService"
+#endif
 
 void
 payload_main(uint64_t a0, uint64_t a1, uint64_t a2,
@@ -118,6 +124,68 @@ ik_publish_ioreg_property(void)
 }
 
 /*
+ * Registering an actual node, rather than a property on somebody else's.
+ *
+ * THE OBJECT IS ALLOCATED BY THE KERNEL, WHICH IS THE WHOLE TRICK.  Defining
+ * our own IOService subclass would mean emitting a vtable, and on arm64e a
+ * vtable is a table of signed pointers.  Asking the runtime to allocate an
+ * instance of a class it already knows gives us an object whose vtable is the
+ * kernel's own, correctly signed, with nothing constructed by us.  Every call
+ * below then goes directly to the concrete implementation -- which is exactly
+ * what virtual dispatch on that object would have reached anyway.
+ *
+ * The addresses came out of the class's vtable rather than a name match: the
+ * symbol table scored `attach` at 0.28 and `registerService` at 0.42, which is
+ * not good enough to call blind, and the vtable gives them exactly.
+ */
+static void
+ik_register_ioservice(void)
+{
+#if defined(KADDR_OSMetaClass_allocClassWithName) && \
+    defined(KADDR_IOService_init) && \
+    defined(KADDR_IORegistryEntry_setName_cstr) && \
+    defined(KADDR_IOService_getServiceRoot) && \
+    defined(KADDR_IOService_attach) && \
+    defined(KADDR_IOService_registerService)
+	static const uint64_t MARK = 0x494b4e4f444531ULL;       /* "IKNODE1" */
+	volatile uint64_t *once = (volatile uint64_t *)
+	    ((char *)kp_addr(KADDR_scratch) + 24);
+	void *obj, *provider;
+
+	if (*once == MARK)
+		return;
+	*once = MARK;                   /* set FIRST: one attempt, never a loop */
+
+	obj = KP_CALL(void *, KADDR_OSMetaClass_allocClassWithName,
+	    const char *)(IK_IOREG_CLASS);
+	if (obj == 0) {
+		klog_err("insert_kext (node): allocClassWithName returned null");
+		return;
+	}
+	if (!KP_CALL(int, KADDR_IOService_init, void *, void *)(obj, 0)) {
+		klog_err("insert_kext (node): init failed");
+		return;
+	}
+	KP_CALL(int, KADDR_IORegistryEntry_setName_cstr,
+	    void *, const char *, void *)(obj, IK_IOREG_NODE, 0);
+
+	provider = KP_CALL(void *, KADDR_IOService_getServiceRoot, void)();
+	if (provider == 0) {
+		klog_err("insert_kext (node): no service root");
+		return;
+	}
+	if (!KP_CALL(int, KADDR_IOService_attach, void *, void *)(obj, provider)) {
+		klog_err("insert_kext (node): attach failed");
+		return;
+	}
+	KP_CALL(void, KADDR_IOService_registerService,
+	    void *, unsigned int)(obj, 0);
+
+	klog_err("insert_kext (node): registered %s at %p", IK_IOREG_NODE, obj);
+#endif
+}
+
+/*
  * Reached through _kp_sysctl_entry, which supplies the BTI landing pad the
  * kernel's authenticated indirect call requires.  Logging here is not noise:
  * it happens once per read, when somebody asked.
@@ -128,6 +196,7 @@ KSYSCTL_HANDLER(payload_sysctl)
 	    KLOG_ADDR(kp_slide()));
 
 	ik_publish_ioreg_property();
+	ik_register_ioservice();
 
 	return ksysctl_handle_int(oidp, arg1, arg2, req);
 }
