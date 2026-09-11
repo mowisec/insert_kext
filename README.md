@@ -348,6 +348,7 @@ because the kext's own memory is read-only.
 | `slack <image> [--min N]` | zero runs per segment, executable ones flagged |
 | `build <image> [--kext ...]` | source → blob, with the position-independence proof |
 | `verify <image> <patched>` | diff against stock, decoding branch targets |
+| `check <image>` | ask a booted device whether the image did what `insert` said it would |
 | `selftest <image>` | the detour classifier against `llvm-objdump` |
 
 Global options: `--config` (auto-selected by content if omitted), `--variant`
@@ -361,6 +362,87 @@ must still be zero. A kernelcache that does not match the config fails the
 build rather than producing a bad image.
 
 ---
+
+## Checking it on a device
+
+`insert` writes an expectations file next to the image. `check` takes it to a
+booted device and asks whether the image did what the build said it would:
+
+```
+insert_kext.py check hello.im4p --ssh "ssh -p 2222 root@localhost"
+```
+
+```
+  [PASS]  booted image           ... root:xnu-13432.2.10~5/IK645C4_ARM64_T8150 ...
+  [PASS]  sysctl registered      debug.insert_kext listed -- so the hook ran and payload_main registered it
+  [PASS]  sysctl value           debug.insert_kext = 42
+  [PASS]  sysctl description     insert_kext example node
+  [PASS]  log: sysctl handler    2 line(s) matching 'insert_kext (sysctl)'
+
+5/5 checks passed
+```
+
+Exit status is non-zero if anything failed.
+
+Three things about it that are deliberate:
+
+* **The build tag is checked first**, and everything else is meaningless
+  without it. A patch that only misbehaves on failure is silent both when it
+  works and when it never ran.
+* **It is one round trip.** The kernel log ring is small and busy -- on the
+  device this was written against it wraps in well under a minute -- so a
+  `sysctl` read in one connection and a `dmesg` in the next will usually show
+  the read having left no trace. The remote script reads the sysctl and
+  captures the log immediately after, in the same shell.
+* **There is no log check for the boot hook.** The hook registers the sysctl
+  once and then stays quiet, so any line it printed has long since scrolled.
+  The registration *is* the evidence: nothing else puts that node there.
+
+`--tool-dir` names a directory holding `sysctl`/`dmesg` if they are not on the
+device's PATH (globs allowed). The script goes over as a quoted argument rather
+than down stdin, because a stripped-down device may have no working `/bin/sh`.
+
+## Reaching the kext from userspace
+
+Two channels, and they carry different things.
+
+| | `--sysctl NAME` | `--syscall-slot N` |
+|---|---|---|
+| reached with | `sysctl debug.NAME` | `syscall(N, a, b, c)` |
+| carries in | nothing | three full 64-bit arguments |
+| carries out | one int | one int, through `*retval` |
+| needs | `sysctl_register_oid` etc. in the config | a `sysent_table` in the config |
+| kext provides | `payload_sysctl` | `payload_syscall` |
+
+`--syscall-slot` points a **spare** `sysent` slot at the kext. It refuses any
+slot the config does not list as spare, because patching a live one replaces a
+syscall the system uses.
+
+The slot is a chained-fixup pointer that the loader rebases and PAC-signs, so
+the patcher rewrites only the 30-bit target and **copies every PAC field from a
+reference slot the image already contains**, refusing if they disagree. That
+rule is not decoration: see the sysctl section for what happened when this
+project constructed PAC fields instead of copying them.
+
+Note that the default `payload_syscall` returns `ENOSYS`, which is also what an
+unpatched spare slot returns -- so a test against it cannot tell a working
+channel from one nobody touched. The example kext returns a recognisable value
+instead.
+
+## Patching instructions directly
+
+Two mechanisms, both of which refuse to write unless the bytes they expect are
+already there:
+
+```
+--poke <VA>=<OLD>:<NEW>     ad-hoc, one instruction
+--extra <NAME>              a named entry in the config's extra_patches
+```
+
+A stale VA -- from a re-symbolicated address, or simply a different
+kernelcache -- would otherwise be patched into the wrong place silently, and
+the result is a kernel that is wrong in a way no diff will look odd. So `OLD`
+is mandatory and a mismatch is a build failure.
 
 ## Installing the result
 

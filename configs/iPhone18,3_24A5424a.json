@@ -69,5 +69,34 @@
       "default_tail": "branch:0xfffffe000b1d48b4"
     }
   },
-  "sysctl_parent_path": "debug"
+  "sysctl_parent_path": "debug",
+  "sysent_table": {
+    "_note": "558 slots of 24 bytes, of which 15 still point at nosys.  The table lives in __DATA_CONST, so sy_call is NOT a plain VA: it is a DYLD_CHAINED_PTR_64_KERNEL_CACHE link that the boot loader rebases and PAC-signs.  unix_syscall authenticates it with `blraa x8, x17`, x17 = 0xbcad, which is exactly the diversity the file already carries -- so a patch must KEEP the PAC fields and rewrite only the 30-bit target.  reference_slot 3 is read(2), an ordinary 3-argument syscall; its munger, sy_narg and sy_arg_bytes are copied verbatim so a patched slot has the shape of a syscall this kernel already dispatches.",
+    "va": "0xfffffe0007e7e628",
+    "stride": 24,
+    "nslots": 558,
+    "nosys": "0xfffffe000b05fb60",
+    "munge_3args": "0xfffffe000aca53f0",
+    "reference_slot": 3,
+    "spare_slots": [
+      8,
+      11,
+      17,
+      19,
+      21,
+      22,
+      275,
+      276,
+      391,
+      392,
+      393,
+      483,
+      493,
+      495,
+      519
+    ]
+  },
+  "extra_patches": {
+    "_note": "Named single-instruction patches, applied with --extra NAME. Each names the bytes it expects to find, so a config that does not match the image fails the build instead of patching the wrong place.  None are shipped: what belongs here is specific to what you are doing."
+  }
 }

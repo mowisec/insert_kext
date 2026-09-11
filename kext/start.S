@@ -140,6 +140,40 @@ _kp_sysctl_entry:
     ldp     x29, x30, [sp], #0x10
     ret
 
+/*
+ * A second way in, for a kext reached as a SYSTEM CALL rather than through a
+ * stolen BL or a sysctl.
+ *
+ * `insert_kext insert --syscall-slot N` points sysent[N].sy_call here, so
+ * userspace reaches the kext with syscall(N, a, b, c).  XNU calls it as
+ *
+ *     int sy_call(struct proc *p, void *uap, int32_t *retval)
+ *
+ * an ordinary AAPCS64 function, so this thunk only does the one thing the C
+ * function cannot be trusted to do for itself: land a `bti c`.  The kernel
+ * dispatches with an authenticated indirect call, so the target must be a
+ * type-C landing pad, and clang emits one for a C function only when it can
+ * see the address escape -- which it cannot here, because the address is taken
+ * by the injector after the link.
+ *
+ * No PAC in the thunk: the kext is not built with pac-ret, and a `retab` here
+ * would have to match a `pacibsp` we do not want to depend on.
+ *
+ * A kext with no use for a syscall simply does not define `payload_syscall`;
+ * the build then links kext/nosyscall.S instead, which returns ENOSYS.  Same
+ * single-definition rule as payload_sysctl, and for the same reason: a weak
+ * default living in THIS file would be resolved by the assembler, so the `bl`
+ * below would bind to it and silently ignore the kext's own definition.
+ */
+    .globl  _kp_syscall_entry
+_kp_syscall_entry:
+    bti     c
+    stp     x29, x30, [sp, #-0x10]!
+    mov     x29, sp
+    bl      _payload_syscall
+    ldp     x29, x30, [sp], #0x10
+    ret
+
     .p2align 3
     .globl  _kp_link_va
 _kp_link_va:

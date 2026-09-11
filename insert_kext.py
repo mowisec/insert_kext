@@ -26,10 +26,10 @@ Design notes that matter if you port this:
     rather than derived from the contents on purpose: two builds that happen to
     be byte-identical should still be distinguishable in a log.
 """
-import argparse, json, os, re, secrets, struct, subprocess, sys, tempfile
+import argparse, json, os, re, secrets, shlex, struct, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ikext import image as imageio
+from ikext import image as imageio, sysent
 from ikext.macho import MachO, chained_fixups
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -224,6 +224,8 @@ def _link(cfg, srcs, base, tmp, tag, defines=None):
         if len(objs) > 1 else ""
     if "_payload_sysctl" not in defined:
         objs.append(compile(os.path.join(KEXT_DIR, "nosysctl.S")))
+    if "_payload_syscall" not in defined:
+        objs.append(compile(os.path.join(KEXT_DIR, "nosyscall.S")))
 
     macho = os.path.join(tmp, tag + ".macho")
     # -segalign 4 so the segment may start at an arbitrary word address: the
@@ -295,7 +297,8 @@ def build_blob(cfg, srcs, defines=None):
                 entry=target + syms_a["_kp_entry"] - base_a,
                 orig=target + syms_a["_kp_orig"] - base_a,
                 tail=target + syms_a["_kp_tail"] - base_a,
-                sysctl_entry=target + syms_a["_kp_sysctl_entry"] - base_a)
+                sysctl_entry=target + syms_a["_kp_sysctl_entry"] - base_a,
+                syscall_entry=target + syms_a["_kp_syscall_entry"] - base_a)
     return blob_a, meta
 
 
@@ -505,11 +508,95 @@ def cmd_insert(cfg, img, args):
         print("            one-shot guard + struct sysctl_oid in scratch at %#x"
               % cfg["symbols"]["scratch"])
 
-    # 5. The build tag, always.
-    tag = stamp_build_tag(d, cfg)
+    # 5. Named single-instruction patches from the config, by name.  The
+    #    mechanism is generic; what a config puts in `extra_patches` is its
+    #    own business.
+    for name in args.extra:
+        pch = cfg.get("extra_patches", {}).get(name)
+        if pch is None:
+            raise SystemExit(f"no extra patch named {name!r}; have "
+                             f"{list(cfg.get('extra_patches', {}))}")
+        off, old_hex, new_hex = pch["off"], pch["old"], pch["new"]
+        have = bytes(d[off:off + len(old_hex) // 2]).hex()
+        if have != old_hex:
+            raise SystemExit(f"{name} @ {off:#x}: expected {old_hex}, found {have}")
+        d[off:off + len(old_hex) // 2] = bytes.fromhex(new_hex)
+        print(f"  {off:#09x}  {old_hex} -> {new_hex}  {pch.get('what', name)}")
+
+    # 6. --poke: ad-hoc single-instruction rewrites of kernel text.
+    #
+    #    Each poke names the word it EXPECTS to find as well as the one to
+    #    write, and a mismatch is a build failure.  That is not ceremony: a
+    #    stale VA -- from a re-symbolicated address, or simply a different
+    #    kernelcache -- would otherwise be patched into the wrong place
+    #    silently, and the result is a kernel that is wrong in a way no diff
+    #    will look odd.
+    for spec in args.poke:
+        try:
+            va_s, words = spec.split("=", 1)
+            old_s, new_s = words.split(":", 1)
+            va, old_w, new_w = int(va_s, 0), int(old_s, 0), int(new_s, 0)
+        except ValueError:
+            raise SystemExit(f"--poke {spec!r}: expected VA=OLD:NEW")
+        off = va - base
+        if not (0 <= off < len(d) - 4) or off % 4:
+            raise SystemExit(f"--poke {va:#x}: not a 4-byte aligned address "
+                             "in the image")
+        have = struct.unpack_from("<I", d, off)[0]
+        if have != old_w:
+            raise SystemExit(f"--poke {va:#x}: image holds {have:#010x}, "
+                             f"--poke says {old_w:#010x}.  REFUSING.  Either "
+                             "the address is wrong or this is not the "
+                             "kernelcache the address was read from.")
+        struct.pack_into("<I", d, off, new_w)
+        print(f"  {off:#09x}  VA {va:#x}  {old_w:#010x} -> {new_w:#010x}  (poke)")
+
+    # 7. Spare syscall slots -> the kext, reachable as syscall(N, a, b, c).
+    for spec in args.syscall_slot:
+        if "sysent_table" not in cfg:
+            raise SystemExit("--syscall-slot needs a `sysent_table` in the config")
+        rep = sysent.patch(cfg, d, int(spec, 0), meta["syscall_entry"])
+        print(f"  {rep['file_off']:#09x}  sysent[{rep['slot']}] sy_call -> "
+              f"{rep['target']:#x} (was nosys); munge/narg/arg_bytes copied "
+              f"from slot {rep['reference']}")
+        print(f"            chain page: {rep['links_before']} -> "
+              f"{rep['links_after']} links, every prior link intact")
+        print(f"            reach it with syscall({rep['slot']}, a, b, c)")
+
+    # 8. The build tag, always.
+    tag = None if args.no_mark else stamp_build_tag(d, cfg)
     if tag:
         print(f"  build tag: {tag}   "
               f"(check `uname -a` against this before believing anything)")
+
+    expect = {
+        "build_tag": tag,
+        "kext": [os.path.basename(x) for x in srcs],
+        "hooks": {n: len(cfg["hooks"][n]["sites"]) for n in args.hook},
+        "detour": args.detour,
+        "sysctl": ({"path": (("%s.%s" % (cfg.get("sysctl_parent_path"), args.sysctl))
+                             if cfg.get("sysctl_parent_path") else args.sysctl),
+                    "parent": cfg.get("sysctl_parent_path", ""),
+                    "name": args.sysctl,
+                    "value": args.sysctl_value,
+                    "descr": args.sysctl_descr}
+                   if args.sysctl else None),
+        "dmesg": {"boot": args.expect_log_boot, "sysctl": args.expect_log_sysctl,
+                  "syscall": args.expect_log_syscall},
+    }
+    if args.syscall_slot:
+        # The example kext returns IK_SYSCALL_MAGIC + the first argument, so a
+        # probe proves BOTH that the slot reaches our code and that the three
+        # arguments arrived.  A kext that returns something else needs
+        # --expect-syscall-retval.
+        a0 = 0x11
+        expect["syscall"] = {
+            "slot": int(args.syscall_slot[0], 0),
+            "args": [a0, 0x22, 0x33],
+            "retval": (args.expect_syscall_retval
+                       if args.expect_syscall_retval is not None
+                       else 0x4B450000 + a0),
+        }
 
     out = args.out or "kernelcache.insert_kext.im4p"
     raw_out = os.path.splitext(out)[0] + ".raw"
@@ -524,7 +611,9 @@ def cmd_insert(cfg, img, args):
     package(cfg, img, bytes(d), out)
     if tag:
         open(out + ".uname", "w").write(tag + "\n")
-    print(f"\nwrote {out}  (and {raw_out})")
+    json.dump(expect, open(out + ".expect.json", "w"), indent=2)
+    print(f"\nwrote {out}  (and {raw_out}, {os.path.basename(out)}.expect.json)")
+    print(f"after booting it:  insert_kext.py check {out} --ssh '<ssh command>'")
 
 
 # ---------------------------------------------------------------- verify ----
@@ -581,6 +670,202 @@ def package(cfg, img, payload, out):
     open(out, "wb").write(tlv(0x30, body))
     print(f"\npackaged {out}: {len(props)}-byte properties element spliced, "
           "uncompressed (the only form confirmed to boot)")
+
+
+# ----------------------------------------------------------------- check ----
+#
+# The end-to-end test.  `insert` writes down what the image SHOULD do; `check`
+# goes to a device and asks whether it does.
+#
+# Everything happens in ONE round trip, and that is not tidiness.  The kernel
+# message ring is small and busy -- on the device this was written against it
+# wraps in well under a minute -- so a `sysctl` read in one connection and a
+# `dmesg` in the next will usually show the read having left no trace.  The
+# remote script therefore reads the sysctl and captures the log immediately
+# after, in that order, in the same shell.
+
+REMOTE_SCRIPT = r"""
+set -u
+S=sysctl; D=dmesg
+for d in %(tooldirs)s; do
+    [ -x "$d/sysctl" ] && S="$d/sysctl"
+    [ -x "$d/dmesg" ]  && D="$d/dmesg"
+done
+echo "###UNAME"
+uname -a 2>&1
+echo "###NAMES"
+%(names)s
+echo "###VALUE"
+%(value)s
+echo "###DESCR"
+%(descr)s
+echo "###SYSCALL"
+%(syscall)s
+echo "###DMESG"
+$D 2>/dev/null | tail -n 400
+echo "###END"
+"""
+
+
+def _section(text, name):
+    try:
+        body = text.split("###" + name + "\n", 1)[1]
+    except IndexError:
+        return ""
+    return re.split(r"^###", body, maxsplit=1, flags=re.M)[0].strip()
+
+
+def cmd_check(cfg, img, args):
+    # Accept either the expectations file or the image it sits next to.  The
+    # sibling is preferred whenever it exists, because the image path also
+    # "exists" and would otherwise be handed to a JSON parser.
+    exp_path = args.expect
+    sibling = exp_path + ".expect.json"
+    if os.path.exists(sibling):
+        exp_path = sibling
+    elif not (os.path.exists(exp_path) and exp_path.endswith(".json")):
+        raise SystemExit(f"no expectations file at {sibling}"
+                         + ("" if exp_path.endswith(".json")
+                            else f" (and {exp_path} is not a .json)")
+                         + ".  It is written next to the image by `insert`.")
+    exp = json.load(open(exp_path))
+    print(f"expectations: {exp_path}")
+    sc = exp.get("sysctl")
+
+    # NOT quoted, so a glob expands on the device -- a tool directory whose
+    # name carries a build-specific suffix is the normal case.  The cost is
+    # that a path with spaces in it will not work.
+    tooldirs = " ".join(args.tool_dir) or '""'
+    if sc:
+        parent = sc["parent"] or ""
+        names = ('$S -N %s 2>/dev/null | grep -x %s || echo "(absent)"'
+                 % (parent or sc["path"], sc["path"]))
+        value = '$S -n %s 2>&1' % sc["path"]
+        descr = '$S -d %s 2>&1' % sc["path"]
+    else:
+        names = value = descr = 'echo "(no sysctl in this build)"'
+
+    # The syscall probe needs something on the device that can issue a raw
+    # syscall.  perl can, and is the likeliest thing to be present; if it is
+    # not, the probe reports that rather than failing the run, because a
+    # missing probe tool says nothing about the image.
+    sy = exp.get("syscall")
+    if sy:
+        a = sy["args"]
+        syscall = ('if command -v perl >/dev/null 2>&1; then '
+                   "perl -e 'print syscall(%d, %d, %d, %d), \"\\n\"'; "
+                   'else echo "(no perl on the device)"; fi'
+                   % (sy["slot"], a[0], a[1], a[2]))
+    else:
+        syscall = 'echo "(no syscall slot in this build)"'
+
+    script = REMOTE_SCRIPT % dict(tooldirs=tooldirs, names=names,
+                                  value=value, descr=descr, syscall=syscall)
+
+    # The script goes as an ARGUMENT, not down stdin.  `ssh host sh -s` needs a
+    # working /bin/sh on the far side, and a stripped-down device may not have
+    # one -- iOS's is a bash variant that fails to exec when bash lives
+    # somewhere else.  Passing the script as one quoted argument lets ssh hand
+    # it to whatever the account's login shell actually is.
+    if args.ssh:
+        cmd = args.ssh + " " + shlex.quote(script)
+        print(f"$ {args.ssh} <script>")
+    else:
+        cmd = script
+        print("$ (running locally)")
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if "###END" not in r.stdout:
+        raise SystemExit("the remote script did not run to completion.\n"
+                         f"stdout: {r.stdout[-400:]!r}\nstderr: {r.stderr[-400:]!r}")
+
+    uname = _section(r.stdout, "UNAME")
+    dmesg = _section(r.stdout, "DMESG")
+    results = []
+
+    def check(name, ok, detail):
+        results.append((ok, name, detail))
+
+    # 1. THE IMAGE.  Everything below is meaningless if a different kernel
+    #    booted, so this is first and the rest is worth nothing without it.
+    tag = exp.get("build_tag")
+    if tag:
+        check("booted image", tag in uname,
+              uname if tag in uname else f"expected {tag!r}, got: {uname}")
+    else:
+        check("booted image", True, "(no build tag in this image)")
+
+    if sc:
+        listed = _section(r.stdout, "NAMES")
+        value = _section(r.stdout, "VALUE")
+        descr = _section(r.stdout, "DESCR")
+        # 2. REGISTERED.  A name walk does not call the leaf handler, so this
+        #    separates "the node exists" from "the handler is callable" -- the
+        #    two failed independently while this tool's target was written.
+        check("sysctl registered", listed == sc["path"],
+              f"{sc['path']} listed -- so the hook ran and payload_main "
+              f"registered it" if listed == sc["path"]
+              else f"not listed ({listed!r})")
+        # 3. HANDLER CALLABLE, and returning what was baked in.
+        check("sysctl value", value == str(sc["value"]),
+              f"{sc['path']} = {value}" if value == str(sc["value"])
+              else f"expected {sc['value']}, got {value!r}")
+        got_descr = descr.split(":", 1)[1].strip() if ":" in descr else descr
+        check("sysctl description", got_descr == sc["descr"],
+              got_descr if got_descr == sc["descr"]
+              else f"expected {sc['descr']!r}, got {got_descr!r}")
+
+    # 3b. THE SYSCALL CHANNEL, if this image has one.
+    if sy:
+        got = _section(r.stdout, "SYSCALL")
+        if "no perl" in got:
+            check("syscall channel", True,
+                  "SKIPPED -- no perl on the device to issue syscall(%d); the "
+                  "slot is patched and the machine booted, which is not the "
+                  "same as the call having been made" % sy["slot"])
+        else:
+            check("syscall channel", got == str(sy["retval"]),
+                  "syscall(%d, %#x, ...) = %s" % (sy["slot"], sy["args"][0], got)
+                  if got == str(sy["retval"])
+                  else "expected %d, got %r" % (sy["retval"], got))
+
+    # 4. THE KEXT ACTUALLY RAN.
+    #
+    # For the hook there is no log check, on purpose.  The hook's job is to
+    # register the sysctl once and then stay quiet, so any line it printed has
+    # long since scrolled out of a ring buffer that wraps in under a minute.
+    # The registration IS the evidence: nothing else puts that node there.
+    #
+    # The handler's line is different -- it is printed on demand, by the read
+    # this script just performed, which is why the remote script captures the
+    # log in the same round trip.
+    pats = exp.get("dmesg", {})
+    if sy and pats.get("syscall"):
+        n = dmesg.count(pats["syscall"])
+        check("log: syscall handler", n > 0,
+              f"{n} line(s) matching {pats['syscall']!r}" if n
+              else f"no line matching {pats['syscall']!r} in the last 400")
+    if sc and pats.get("sysctl"):
+        n = dmesg.count(pats["sysctl"])
+        check("log: sysctl handler", n > 0,
+              f"{n} line(s) matching {pats['sysctl']!r}" if n
+              else f"no line matching {pats['sysctl']!r} in the last 400")
+    elif pats.get("boot"):
+        n = dmesg.count(pats["boot"])
+        check("log: boot hook", n > 0,
+              f"{n} line(s) matching {pats['boot']!r}" if n
+              else f"no line matching {pats['boot']!r} in the last 400 -- with "
+                   "no sysctl this is one-shot at boot, so a long-running "
+                   "device will have scrolled past it")
+
+    print()
+    for ok, name, detail in results:
+        print(f"  [{'PASS' if ok else 'FAIL'}]  {name:<22} {detail}")
+    bad = [x for x in results if not x[0]]
+    print(f"\n{len(results) - len(bad)}/{len(results)} checks passed")
+    if bad and not any(x[1] == "booted image" for x in bad):
+        print("the expected image is running, so these are real failures of the "
+              "kext rather than of the install", file=sys.stderr)
+    return not bad
 
 
 # -------------------------------------------------------------- selftest ----
@@ -665,6 +950,16 @@ def main():
     p.add_argument("--kext", action="append", help="kext source; repeatable")
     p.add_argument("-o", "--out")
     p = sub.add_parser("verify"); p.add_argument("image"); p.add_argument("patched")
+    p = sub.add_parser("check", help="ask a booted device whether the image did "
+                                     "what `insert` said it would")
+    p.add_argument("expect", help="the .expect.json `insert` wrote, or the image "
+                                  "path it sits next to")
+    p.add_argument("--ssh", default="", metavar="CMD",
+                   help="command that runs a shell on the device, e.g. "
+                        "\"ssh -p 2222 root@localhost\".  Omit to run locally.")
+    p.add_argument("--tool-dir", action="append", default=[], metavar="DIR",
+                   help="directory holding sysctl/dmesg if they are not on the "
+                        "device's PATH; repeatable, shell globs allowed")
     p = sub.add_parser("selftest"); p.add_argument("image")
     p.add_argument("--va", default="0xfffffe000ac73000")
     p.add_argument("--size", default="0x10000")
@@ -688,11 +983,41 @@ def main():
     p.add_argument("--sysctl-value", type=int, default=1,
                    help="the int the sysctl reads back (default 1)")
     p.add_argument("--sysctl-descr", default="insert_kext example node")
+    p.add_argument("--extra", action="append", default=[], metavar="NAME",
+                   help="apply the config's extra_patches entry NAME; repeatable")
+    p.add_argument("--poke", action="append", default=[], metavar="VA=OLD:NEW",
+                   help="replace one instruction in kernel text.  OLD is the "
+                        "word that must already be there and NEW the "
+                        "replacement, both hex; the build FAILS if OLD does not "
+                        "match, so a wrong address cannot be patched silently.")
+    p.add_argument("--syscall-slot", action="append", default=[], metavar="N",
+                   help="point spare sysent slot N at the kext's "
+                        "payload_syscall, reachable as syscall(N, a, b, c)")
+    p.add_argument("--no-mark", action="store_true",
+                   help="skip the build tag.  Strongly discouraged: the tag is "
+                        "how `uname -a` tells you which image booted.")
+
+    p = sub.choices["insert"]
+    p.add_argument("--expect-log-boot", default="insert_kext (boot hook)",
+                   help="substring `check` should find in the device log to "
+                        "prove the boot hook ran")
+    p.add_argument("--expect-log-sysctl", default="insert_kext (sysctl)",
+                   help="substring `check` should find to prove the sysctl "
+                        "handler ran")
+    p.add_argument("--expect-log-syscall", default="insert_kext (syscall)",
+                   help="substring `check` should find to prove the syscall "
+                        "handler ran")
+    p.add_argument("--expect-syscall-retval", type=int, default=None,
+                   help="what syscall(N, 0x11, 0x22, 0x33) should return; "
+                        "defaults to what the example kext returns")
 
     args = ap.parse_args()
-    img = imageio.load(args.image, args.variant, args.stock_im4p)
-    cfg = pick_config(img, args.config)
-    r = globals()["cmd_" + args.cmd](cfg, img, args)
+    if args.cmd == "check":
+        r = cmd_check(None, None, args)
+    else:
+        img = imageio.load(args.image, args.variant, args.stock_im4p)
+        cfg = pick_config(img, args.config)
+        r = globals()["cmd_" + args.cmd](cfg, img, args)
     if r is False:
         sys.exit(1)
 
