@@ -161,6 +161,49 @@ def props_set(props, name, value):
     return der_tlv(0xa0, der_tlv(0x30, inner))
 
 
+def props_extend_boot_exec(props, payload_len, verbose=True):
+    """Extend the boot-executable region to the end of the payload, leaving
+    its start where it is.
+
+    The alternative to moving that region's descriptor (`props_retile_tail`,
+    which is refused): grow it in place so it runs from its existing start all
+    the way past the append.  Its start keeps both properties a stock table
+    has -- it still begins exactly where the executable region ends, and it
+    still contains the entry point at its first byte -- so whatever rule
+    refuses the moved descriptor cannot be what is being tested here.
+
+    What IS being tested is overlap: the read-write and read-only regions then
+    lie INSIDE the extended one.  They sit later in the property struct, and
+    the loader places regions at their physical destinations in that same slot
+    order, so a walk in slot order with later entries winning would re-type
+    those ranges correctly and leave only the appended tail boot-executable.
+
+    UNVERIFIED.  Whether overlapping regions are accepted at all is exactly
+    the open question.
+    """
+    d = props_get(props)
+    for k in ("kcbf", "kcbz", "kcxf", "kcxz"):
+        if k not in d:
+            raise SystemExit(f"properties element has no {k}")
+    if d["kcbf"] != d["kcxf"] + d["kcxz"]:
+        raise SystemExit("the boot-executable region does not abut the "
+                         "executable one; this image is not the shape this "
+                         "extension assumes")
+    if payload_len <= d["kcbf"]:
+        raise SystemExit("payload ends before the boot-executable region starts")
+    new_z = payload_len - d["kcbf"]
+    out = props_set(props, "kcbz", new_z)
+    if verbose:
+        print(f"\nextended the boot-executable region over the appended bytes")
+        print(f"  kcbf  {d['kcbf']:#x}  (UNCHANGED -- still abuts the executable "
+              "region, still holds the entry point)")
+        print(f"  kcbz  {d['kcbz']:#x} -> {new_z:#x}   now spans "
+              f"[{d['kcbf']:#x}, {payload_len:#x})")
+        print("  the read-write and read-only regions now lie INSIDE it; "
+              "whether that is accepted is the experiment")
+    return out
+
+
 def props_retile_tail(props, payload_len, verbose=True):
     """Give bytes appended to the payload an EXECUTABLE region, without
     moving anything.

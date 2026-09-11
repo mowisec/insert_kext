@@ -223,7 +223,8 @@ def _seg64(nm, va, vsize, fo, fsize, maxp, initp):
 
 
 def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
-               rx_name="__KEXT_EXEC", rw_name="__KEXT_DATA", verbose=True):
+               rx_name="__KEXT_EXEC", rw_name="__KEXT_DATA", top_level=True,
+               verbose=True):
     """Append one `MH_KEXT_BUNDLE` fileset entry carrying `code`.
 
     -> (new image bytes, geometry dict).  `geometry` gives the file offset and
@@ -234,6 +235,12 @@ def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
     holding the entry's header page followed by its `__TEXT_EXEC`, and an rw-
     one holding its `__DATA`.  The entry shares the image's existing
     `__LINKEDIT` and declares no symbols, exactly as every stock entry does.
+
+    `top_level=False` emits **no** new top-level segments and adds only the
+    `LC_FILESET_ENTRY`, leaving the appended range for the caller to cover by
+    other means -- for instance by repointing an existing top-level segment at
+    it, which keeps the segment count unchanged.  `data_size=0` gives the entry
+    a zero-length `__DATA`, which it must still declare.
     """
     d = bytearray(raw)
     img = Image(d)
@@ -258,8 +265,13 @@ def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
     exec_sz = len(code)
     rx_fsize = PAGE + exec_sz + pad(PAGE + exec_sz)
     data_fo = hdr_fo + rx_fsize
-    rw_fsize = data_size + pad(data_size)
-    rx_va, rw_va = img.map_base + hdr_fo, img.map_base + data_fo
+    rw_fsize = data_size + pad(data_size) if data_size else 0
+    rx_va = img.map_base + hdr_fo
+    # A zero-length __DATA still has to exist and still has to sit inside a
+    # top-level segment, so park it at the entry's own base.
+    rw_va = img.map_base + data_fo if data_size else rx_va
+    if not data_size:
+        data_fo = hdr_fo
 
     sub_cmds = b"".join([
         _seg64(b"__TEXT", rx_va, PAGE, hdr_fo, PAGE, 5, 1),
@@ -285,10 +297,12 @@ def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
     fse = struct.pack("<IIQQII", LC_FILESET_ENTRY,
                       32 + align8(len(nm) + 1), rx_va, hdr_fo, 32, 0)
     fse += nm + b"\0" * (align8(len(nm) + 1) - len(nm))
-    newcmds = (_seg64(rx_name.encode(), rx_va, rx_fsize, hdr_fo, rx_fsize, 5, 5)
-               + _seg64(rw_name.encode(), rw_va, max(rw_fsize, data_size),
-                        data_fo, rw_fsize, 3, 3)
-               + fse)
+    newcmds = fse if not top_level else (
+        _seg64(rx_name.encode(), rx_va, rx_fsize, hdr_fo, rx_fsize, 5, 5)
+        + _seg64(rw_name.encode(), rw_va, max(rw_fsize, data_size),
+                 data_fo, rw_fsize, 3, 3)
+        + fse)
+    ncmds_added = 1 if not top_level else 3
 
     t = img.seg("__TEXT")
     slack_end = t["foff"] + t["fsize"]
@@ -298,23 +312,25 @@ def emit_entry(raw, name, code=b"", text=b"", data_size=PAGE,
     if any(d[img.lcend:img.lcend + len(newcmds)]):
         raise SystemExit("header slack is not zero where the new commands would go")
     d[img.lcend:img.lcend + len(newcmds)] = newcmds
-    struct.pack_into("<II", d, 16, img.ncmds + 3, img.sizeofcmds + len(newcmds))
+    struct.pack_into("<II", d, 16, img.ncmds + ncmds_added,
+                     img.sizeofcmds + len(newcmds))
 
     d += page0
     d += code + b"\0" * pad(PAGE + exec_sz)
     d += b"\0" * rw_fsize
 
-    geom = dict(name=name, hdr_fo=hdr_fo, hdr_va=rx_va,
+    geom = dict(name=name, hdr_fo=hdr_fo, hdr_va=rx_va, rx_fsize=rx_fsize,
                 exec_fo=exec_fo, exec_va=img.map_base + exec_fo, exec_size=exec_sz,
                 data_fo=data_fo, data_va=rw_va, data_size=data_size,
                 rx_name=rx_name, rw_name=rw_name,
                 grown=len(d) - orig_len, length=len(d))
     if verbose:
         print(f"\nappended fileset entry {name!r}")
-        print(f"  {rx_name:<12} va {rx_va:#x}  fo {hdr_fo:#x}  {rx_fsize} bytes  r-x")
+        print(f"  {rx_name if top_level else '(no top-level)':<14} "
+              f"va {rx_va:#x}  fo {hdr_fo:#x}  {rx_fsize} bytes  r-x")
         print(f"  {'__TEXT_EXEC':<12} va {geom['exec_va']:#x}  fo {exec_fo:#x}  "
               f"{exec_sz} bytes  <- the code")
         print(f"  {rw_name:<12} va {rw_va:#x}  fo {data_fo:#x}  {rw_fsize} bytes  rw-")
-        print(f"  ncmds {img.ncmds} -> {img.ncmds + 3}, "
+        print(f"  ncmds {img.ncmds} -> {img.ncmds + ncmds_added}, "
               f"file {orig_len} -> {len(d)} (+{len(d) - orig_len})")
     return bytes(d), geom
