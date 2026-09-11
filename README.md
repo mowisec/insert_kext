@@ -6,8 +6,12 @@ Compile a kext from C source and put it into an iOS kernelcache.
 decompressed Mach-O — compiles your code into a freestanding,
 position-independent blob, splices it into unused space in the image, rewires
 one or more existing instructions so it runs, optionally gives it a real
-`sysctl` node, stamps a random build tag into the kernel version string, and
-packages the result as a bootable IM4P.
+`sysctl` node and a `syscall`, stamps a random build tag into the kernel
+version string, and packages the result as a bootable IM4P.
+
+It can also add a real, named `MH_KEXT_BUNDLE` fileset entry for your code, so
+the image carries an actual bundle identifier rather than only an anonymous
+blob — see *Two ways in* below for what that does and does not buy you.
 
 It is standalone. It knows nothing about any particular device beyond what a
 JSON config tells it, so it should carry over to another iPhone, another iOS
@@ -21,12 +25,12 @@ insert_kext.py insert kernelcache.research.im4p \
 ```
 
 ```
-kext:   hello.c  571 bytes, 15805 bytes of slack left
+kext:   hello.c  1874 bytes, 14502 bytes of slack left
   tail:     branch:0xfffffe000b1d48b4
-  0x4368008  571 bytes  kext (entry 0xfffffe000b36c008)
+  0x4368008  1874 bytes  kext (entry 0xfffffe000b36c008)
   25 sites  hook 'oslog_extensible_paniclog' -> 0xfffffe000b36c008
-  0xfffffe0008412e30  sysctl 'debug.insert_kext' -> handler 0xfffffe000b36c080, returns 42
-  build tag: IKCEFFB_ARM64_T8150
+  sysctl 'debug.insert_kext' registered at runtime by the kext (handler 0xfffffe000b36c080, reads back 42)
+  build tag: IKC8EA0_ARM64_T8150   (check `uname -a` against this before believing anything)
 ```
 
 On the device:
@@ -41,6 +45,10 @@ debug.insert_kext: insert_kext example node
 $ dmesg | grep insert_kext
 hello from insert_kext (boot hook), slide=000000002ee78000
 hello from insert_kext (sysctl), slide=000000002ee78000
+$ ioreg -l -d 1 | grep insert_kext          # the example kext reaches IOKit too
+      "insert_kext" = "hello"
+$ ioreg | grep insert_kext
+    +-o insert_kext  <class IOService, id 0x100001012, registered, matched, active, ...>
 ```
 
 **Check the build tag before believing anything.** A kext that only misbehaves
@@ -49,23 +57,58 @@ what tells those apart.
 
 ---
 
-## What this does, and what it does not
+## Two ways in, and what each gets you
 
 There are two ways to get your own code into a finished kernelcache, and this
-tool implements the first.
+tool implements both.
 
-| | Slack injection *(what this does)* | Full fileset entry *(not implemented)* |
+**Slack injection** (the default) puts a raw code blob in unused space and
+rewires one instruction to reach it. The file size, every offset and every
+segment stay exactly as they were.
+
+**An appended fileset entry** (`--append-kext <bundle id>`) adds a real, named
+`MH_KEXT_BUNDLE` entry — a bundle identifier, its own Mach-O header, its own
+segments — at the end of the image. **Nothing that already exists moves**
+either: the entry's header goes in new bytes at the end and the three new load
+commands go in the header's zero padding.
+
+| | slack injection | `--append-kext` |
 |---|---|---|
-| What you add | a raw code blob in unused space | a real `MH_FILESET` kext entry with a bundle identifier |
-| Image geometry | **unchanged** — same file size, same offsets | every segment after `__PRELINK_TEXT` moves |
-| Space | whatever slack the image has (16376 bytes on T8150) | as much as you want |
-| IOKit, C++, `OSObject`, driver matching | no | yes |
-| `kextstat` lists it | no | yes |
+| your code runs in the kernel | yes | yes |
+| a named bundle in the image | no | **yes** |
+| image geometry | unchanged | unchanged |
+| code size limit | the image's slack (16376 bytes on T8150) | the same — see below |
+| `__PRELINK_INFO` dictionary | no | with `--prelink-bundle` |
+| listed by `kextstat` | no | **no** |
+| matched as a driver by a personality | no | **no** |
 
-So "kext" here means *your code, running in the kernel, calling kernel
-functions and answering a `sysctl`* — which is what most people want a kext
-for — and **not** a bundle IOKit will match a driver against. If you need
-`IOService` matching or personalities, this is the wrong tool.
+### Where an appended kext's code has to live, and why
+
+Appended bytes can be **mapped** but not made **executable**: the IM4P region
+table has exactly two executable regions, both already spoken for, and every
+attempt to resize or relocate one is refused before the kernel runs. An
+appended `__TEXT_EXEC` therefore takes an instruction-fetch permission fault
+the moment anything calls it.
+
+So `--append-exec slack` puts the entry's **code** in the slack — which is
+already inside an executable region and already runs — while only its header
+page is appended. You get the named bundle and the code, at the slack's size
+limit. `--append-exec appended` exists for images where that calculus differs,
+and will fault on this one.
+
+### What "kext" means here
+
+Your code, running in the kernel, calling kernel functions, answering a
+`sysctl` and a `syscall`, and — as the example kext shows — reaching IOKit well
+enough to publish a property and register an `IOService` node that shows up in
+`ioreg`.
+
+What it is **not** is a driver. The bundle is not listed by `kextstat`: that
+listing enumerates *loaded* kexts, and being loaded needs a `kmod_info`
+structure with PAC-signed `start`/`stop` pointers in writable memory, which an
+appended entry does not have. Nothing matches a personality, and the
+`IOService` the example registers is a stock one with no methods of its own.
+If you need driver matching, this is still the wrong tool.
 
 ---
 
@@ -108,7 +151,8 @@ you hooked, so you can inspect the arguments of the function you displaced.
 Both entry points are optional: a kext with no `payload_sysctl` links a default
 that returns `ENOTSUP`.
 
-Build it with `--kext yourfile.c` (repeatable). See `kext/hello.c`.
+Build it with `--kext yourfile.c` (repeatable). See `kext/hello.c`, which also
+shows a `payload_syscall` and two IOKit examples — see *Reaching IOKit*.
 
 ### The SDK
 
@@ -345,6 +389,8 @@ because the kext's own memory is read-only.
 |---|---|
 | `insert <image>` | the whole pipeline: build, splice, hook, sysctl, tag, package |
 | `info <image>` | segments, fileset entry count, linear-mapping check |
+| `props <image>` | the IM4P `kc*` region table, and whether it still covers the payload |
+| `package <image> -o ...` | wrap an already-patched Mach-O as a bootable IM4P |
 | `slack <image> [--min N]` | zero runs per segment, executable ones flagged |
 | `build <image> [--kext ...]` | source → blob, with the position-independence proof |
 | `verify <image> <patched>` | diff against stock, decoding branch targets |
@@ -353,7 +399,15 @@ because the kext's own memory is read-only.
 
 Global options: `--config` (auto-selected by content if omitted), `--variant`
 (which kernelcache to take out of an `.ipsw`), `--stock-im4p` (where to get the
-IM4P properties element when the input is a bare Mach-O).
+IM4P properties element when the input is a bare Mach-O), `--set-prop
+NAME=VALUE` (rewrite one `kc*` property before packaging).
+
+`insert` options for an appended entry: `--append-kext <bundle id>`,
+`--append-exec slack|appended`, `--append-data-size N`, `--append-cover
+readonly|exec|exec-extend|boot-exec`, `--prelink-bundle`, `--absorb-boot-exec`.
+Only `--append-cover readonly` is known to load; the others exist because the
+question of which region shapes the loader accepts is worth being able to ask,
+and their docstrings say plainly that they are unverified.
 
 Every write asserts what it is overwriting first: the slack must still be all
 zeros, the bytes before it must still match `preceded_by`, a hooked instruction
@@ -377,9 +431,11 @@ insert_kext.py check hello.im4p --ssh "ssh -p 2222 root@localhost"
   [PASS]  sysctl registered      debug.insert_kext listed -- so the hook ran and payload_main registered it
   [PASS]  sysctl value           debug.insert_kext = 42
   [PASS]  sysctl description     insert_kext example node
+  [PASS]  syscall channel        syscall(8, 0x11, ...) = 1262813201
+  [PASS]  log: syscall handler   1 line(s) matching 'insert_kext (syscall)'
   [PASS]  log: sysctl handler    2 line(s) matching 'insert_kext (sysctl)'
 
-5/5 checks passed
+7/7 checks passed
 ```
 
 Exit status is non-zero if anything failed.
@@ -429,6 +485,74 @@ unpatched spare slot returns -- so a test against it cannot tell a working
 channel from one nobody touched. The example kext returns a recognisable value
 instead.
 
+## Reaching IOKit
+
+`kext/hello.c` shows two things an injected kext can do to the IO registry,
+both called from the sysctl handler so a read triggers them on demand:
+
+```c
+/* a property on the registry root */
+root = IORegistryEntry::getRegistryRoot();
+IORegistryEntry::setProperty(root, "insert_kext", "hello");
+
+/* an actual node */
+obj = OSMetaClass::allocClassWithName("IOService");
+IOService::init(obj, NULL);
+IORegistryEntry::setName(obj, "insert_kext", NULL);
+IOService::attach(obj, IOService::getServiceRoot());
+IOService::registerService(obj, 0);
+```
+
+```
+$ ioreg | grep insert_kext
+    +-o insert_kext  <class IOService, id 0x100001012, registered, matched, active, ...>
+```
+
+Both compile away unless the addresses are in the config's `symbols` map, so
+this costs nothing on an image you have not resolved them for.
+
+### It defines no C++ class, and that is deliberate
+
+An `IOService` subclass of your own means emitting a vtable, and on arm64e a
+vtable is a table of **signed pointers**. Producing those by hand is the same
+mistake the sysctl section above cost two panics to learn.
+
+Asking the runtime to allocate an instance of a class it **already knows**
+avoids it entirely: the object comes back with the kernel's own vtable,
+correctly signed, and every call above then goes straight to the concrete
+implementation that virtual dispatch on that object would have reached anyway.
+Nothing is signed by you.
+
+The limit of that trick is that the node has no behaviour of its own — it is a
+stock `IOService`. Giving it methods means a vtable in writable memory with
+entries re-signed for the right key and discriminator, and that is the first
+thing in this tool that you would have to sign yourself.
+
+### Get C++ addresses from the vtable, not from a name match
+
+Worth stating separately, because it is what makes these calls land instead of
+panicking. For the methods above, a symbol table scored:
+
+| method | confidence |
+|---|---|
+| `IOService::attach(IOService*)` | 0.28 |
+| `IOService::registerService(unsigned int)` | 0.42 |
+| `IOService::init(OSDictionary*)` | absent |
+
+None of that is callable blind — a wrong address here passes arguments to the
+wrong function. A tool that recovers class vtables from an arm64e kernelcache
+by their PAC diversifiers (`iometa` is the one used here) gives the entries
+**exactly**, and in this case its values matched the low-confidence symbols, so
+the two independent methods corroborated each other and the missing `init` came
+for free.
+
+For a **non-virtual** function there is no slot to read, so verify it another
+way: `OSMetaClass::allocClassWithName(char const*)` was confirmed by what it
+calls — `OSSymbol::withCStringNoCopy` and then the `OSSymbol*` overload — which
+nothing else does. A fully symbolicated kernel for a different platform of the
+same vintage is also a good cross-check for overload sets, where order and
+relative size are stable even though addresses are not.
+
 ## Patching instructions directly
 
 Two mechanisms, both of which refuse to write unless the bytes they expect are
@@ -449,7 +573,7 @@ is mandatory and a mismatch is a build failure.
 The image must be an **uncompressed IM4P**. Recompressing with a different
 LZFSE encoder makes iBoot take a synchronous exception and panic before the
 kernel runs, so `insert_kext` emits the payload uncompressed and no `0x30`
-compression descriptor. iBoot also needs the 14 `kc*` properties (segment
+compression descriptor. iBoot also needs the 15 `kc*` properties (segment
 sizes, `kclo`, `kcep`) that the stock image carries, so the stock IM4P's
 properties element (DER tag `0xa0`) is spliced onto the new one rather than
 regenerated. That is why the tool wants the IM4P or the `.ipsw` rather than a
@@ -533,8 +657,9 @@ section; the tool will tell you if it overlaps anything.
 ```
 insert_kext.py        the CLI and the injector
 ikext/macho.py        Mach-O, chained fixups, chain_insert
-ikext/image.py        .ipsw / IM4P / Mach-O normalisation, decompression
-ikext/ksysctl.py      static sysctl OID registration
+ikext/image.py        .ipsw / IM4P / Mach-O normalisation, kc* region table
+ikext/fileset.py      appending a fileset entry, and __PRELINK_INFO
+ikext/sysent.py       the spare-syscall-slot patcher
 kext/hello.c          the example kext
 kext/start.S          entry thunks, the position-independence anchor
 kext/include/         the SDK headers
