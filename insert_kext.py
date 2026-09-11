@@ -643,6 +643,24 @@ def cmd_insert(cfg, img, args):
             expect["prelink_bundle"] = append
         expect["append"] = geom
 
+    # The IO registry expectations, recorded only when the config carries the
+    # addresses the example kext's IOKit code is compiled against -- the same
+    # condition as the #if in kext/hello.c, so `check` asks for exactly what
+    # the build put in.  A kext of your own that does something else should
+    # pass --expect-ioreg-property "" / --expect-ioreg-node "" to say so.
+    syms = cfg.get("symbols", {})
+    if args.expect_ioreg_property and all(
+            k in syms for k in ("IORegistryEntry_getRegistryRoot",
+                                "IORegistryEntry_setProperty_cstr")):
+        k, _, v = args.expect_ioreg_property.partition("=")
+        expect["ioreg_property"] = {"key": k, "value": v}
+    if args.expect_ioreg_node and all(
+            k in syms for k in ("OSMetaClass_allocClassWithName", "IOService_init",
+                                "IORegistryEntry_setName_cstr", "IOService_attach",
+                                "IOService_getServiceRoot",
+                                "IOService_registerService")):
+        expect["ioreg_node"] = {"name": args.expect_ioreg_node}
+
     out = args.out or "kernelcache.insert_kext.im4p"
     raw_out = os.path.splitext(out)[0] + ".raw"
     open(raw_out, "wb").write(bytes(d))
@@ -836,10 +854,11 @@ def package(cfg, img, payload, out, cover="exec", absorb=None):
 
 REMOTE_SCRIPT = r"""
 set -u
-S=sysctl; D=dmesg
+S=sysctl; D=dmesg; G=ioreg
 for d in %(tooldirs)s; do
     [ -x "$d/sysctl" ] && S="$d/sysctl"
     [ -x "$d/dmesg" ]  && D="$d/dmesg"
+    [ -x "$d/ioreg" ]  && G="$d/ioreg"
 done
 echo "###UNAME"
 uname -a 2>&1
@@ -851,6 +870,10 @@ echo "###DESCR"
 %(descr)s
 echo "###SYSCALL"
 %(syscall)s
+echo "###IOREG"
+%(ioreg)s
+echo "###IONODE"
+%(ionode)s
 echo "###DMESG"
 $D 2>/dev/null | tail -n 400
 echo "###END"
@@ -909,8 +932,28 @@ def cmd_check(cfg, img, args):
     else:
         syscall = 'echo "(no syscall slot in this build)"'
 
+    # The IO registry probes.  Both run after the sysctl read above, because
+    # in the example kext the sysctl handler is what reaches IOKit -- probing
+    # before it would correctly find nothing and look like a failure.
+    have_ioreg = 'command -v "$G" >/dev/null 2>&1'
+    iop = exp.get("ioreg_property")
+    if iop:
+        ioreg = ('if %s; then "$G" -l -d 1 2>/dev/null | grep -F %s || '
+                 'echo "(absent)"; else echo "(no ioreg)"; fi'
+                 % (have_ioreg, shlex.quote('"%s" = ' % iop["key"])))
+    else:
+        ioreg = 'echo "(no ioreg property in this build)"'
+    ion = exp.get("ioreg_node")
+    if ion:
+        ionode = ('if %s; then "$G" 2>/dev/null | grep -F %s || '
+                  'echo "(absent)"; else echo "(no ioreg)"; fi'
+                  % (have_ioreg, shlex.quote("+-o %s  <class" % ion["name"])))
+    else:
+        ionode = 'echo "(no ioreg node in this build)"'
+
     script = REMOTE_SCRIPT % dict(tooldirs=tooldirs, names=names,
-                                  value=value, descr=descr, syscall=syscall)
+                                  value=value, descr=descr, syscall=syscall,
+                                  ioreg=ioreg, ionode=ionode)
 
     # The script goes as an ARGUMENT, not down stdin.  `ssh host sh -s` needs a
     # working /bin/sh on the far side, and a stripped-down device may not have
@@ -977,6 +1020,31 @@ def cmd_check(cfg, img, args):
                   "syscall(%d, %#x, ...) = %s" % (sy["slot"], sy["args"][0], got)
                   if got == str(sy["retval"])
                   else "expected %d, got %r" % (sy["retval"], got))
+
+    # 3c. THE IO REGISTRY.  These say something the sysctl cannot: that the
+    #     kext reached IOKit and changed state a completely separate userspace
+    #     tool can see.  A missing `ioreg` is reported as a skip rather than a
+    #     failure, because an absent probe says nothing about the image.
+    if iop:
+        got = _section(r.stdout, "IOREG")
+        if "no ioreg" in got:
+            check("ioreg property", True,
+                  "SKIPPED -- no ioreg on the device; nothing was proved either way")
+        else:
+            want = '"%s" = "%s"' % (iop["key"], iop["value"])
+            check("ioreg property", want in got,
+                  got.strip() if want in got
+                  else "expected %r on the registry root, got %r" % (want, got))
+    if ion:
+        got = _section(r.stdout, "IONODE")
+        if "no ioreg" in got:
+            check("ioreg node", True,
+                  "SKIPPED -- no ioreg on the device; nothing was proved either way")
+        else:
+            ok = ("+-o %s  <class" % ion["name"]) in got
+            check("ioreg node", ok,
+                  got.strip()[:120] if ok
+                  else "no %r node in the registry: %r" % (ion["name"], got))
 
     # 4. THE KEXT ACTUALLY RAN.
     #
@@ -1191,6 +1259,14 @@ def main():
                         "how `uname -a` tells you which image booted.")
 
     p = sub.choices["insert"]
+    p.add_argument("--expect-ioreg-property", default="insert_kext=hello",
+                   metavar="KEY=VALUE",
+                   help="what `check` should find on the IO registry root; "
+                        "empty to skip.  Recorded only when the config has the "
+                        "addresses for it")
+    p.add_argument("--expect-ioreg-node", default="insert_kext", metavar="NAME",
+                   help="the IOService node `check` should find in the "
+                        "registry; empty to skip")
     p.add_argument("--expect-log-boot", default="insert_kext (boot hook)",
                    help="substring `check` should find in the device log to "
                         "prove the boot hook ran")

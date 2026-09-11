@@ -1,0 +1,22 @@
+{
+  "build_tag": "IK2BE51_ARM64_T8150",
+  "kext": [
+    "hello.c"
+  ],
+  "hooks": {
+    "oslog_extensible_paniclog": 25
+  },
+  "detour": null,
+  "sysctl": {
+    "path": "debug.insert_kext",
+    "parent": "debug",
+    "name": "insert_kext",
+    "value": 42,
+    "descr": "insert_kext example node"
+  },
+  "dmesg": {
+    "boot": "insert_kext (boot hook)",
+    "sysctl": "insert_kext (sysctl)",
+    "syscall": "insert_kext (syscall)"
+  }
+}

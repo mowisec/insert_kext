@@ -432,10 +432,12 @@ insert_kext.py check hello.im4p --ssh "ssh -p 2222 root@localhost"
   [PASS]  sysctl value           debug.insert_kext = 42
   [PASS]  sysctl description     insert_kext example node
   [PASS]  syscall channel        syscall(8, 0x11, ...) = 1262813201
+  [PASS]  ioreg property         "insert_kext" = "hello"
+  [PASS]  ioreg node             +-o insert_kext  <class IOService, id 0x10000117c, registered, matched, active, ...>
   [PASS]  log: syscall handler   1 line(s) matching 'insert_kext (syscall)'
   [PASS]  log: sysctl handler    2 line(s) matching 'insert_kext (sysctl)'
 
-7/7 checks passed
+9/9 checks passed
 ```
 
 Exit status is non-zero if anything failed.
@@ -450,6 +452,11 @@ Three things about it that are deliberate:
   `sysctl` read in one connection and a `dmesg` in the next will usually show
   the read having left no trace. The remote script reads the sysctl and
   captures the log immediately after, in the same shell.
+* **The IOKit probes run after the sysctl read**, because in the example kext
+  the sysctl handler is what reaches IOKit. Probing first would correctly find
+  nothing.
+* **A missing `ioreg` is a skip, not a failure.** An absent probe tool says
+  nothing about the image, the same reasoning as the `perl`-less syscall case.
 * **There is no log check for the boot hook.** The hook registers the sysctl
   once and then stays quiet, so any line it printed has long since scrolled.
   The registration *is* the evidence: nothing else puts that node there.
