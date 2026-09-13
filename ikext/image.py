@@ -16,7 +16,7 @@ tool, which is the only external dependency and is only reached for that one
 case.  A payload that is already a Mach-O costs nothing either way, so an
 image you decompressed yourself needs no `ipsw` at all.
 """
-import os, shutil, struct, subprocess, sys, tempfile, zipfile
+import os, secrets, shutil, struct, subprocess, sys, tempfile, zipfile
 
 MACHO_MAGIC = b"\xcf\xfa\xed\xfe"
 
@@ -276,3 +276,67 @@ def load(path, variant=None, stock_im4p=None):
     if info["raw"][:4] != MACHO_MAGIC:
         raise SystemExit(f"{path}: payload is not a Mach-O after decompression")
     return info
+
+
+# -------------------------------------------------------------- packaging ---
+#
+# The two steps every consumer of a patched kernelcache needs and none of them
+# should have to rediscover: putting the image back in a wrapper that boots,
+# and stamping it so the device can say which image it is running.
+
+def package(img, payload, out):
+    """Wrap a patched image as an UNCOMPRESSED IM4P, keeping the stock image's
+    properties element.
+
+    Two Apple-specific facts, both of which cost a boot to learn the hard way:
+    recompressing with a different LZFSE encoder makes iBoot take a synchronous
+    exception before the kernel runs, and iBoot needs the `kc*` properties
+    (segment sizes, `kclo`, `kcep`) that the stock image carries.  So the
+    payload goes in uncompressed and the stock properties element is spliced on
+    rather than regenerated.
+    """
+    tlv, props = der_tlv, img["props"]
+    if len(payload) > len(img["raw"]):
+        # An appended entry's header has to be covered by some region or the
+        # image will not load, and the last one is the only size that may
+        # change: every other kc* size is refused outright.  It maps the bytes
+        # read-only, which is all the header needs -- the code lives in the
+        # slack, inside a region that is already executable.
+        pr = props_get(props)
+        grew = len(payload) - (pr["kclf"] + pr["kclz"])
+        props = props_set(props, "kclz", pr["kclz"] + grew)
+        print(f"\ncovered the appended {grew} bytes: kclz {pr['kclz']} -> "
+              f"{pr['kclz'] + grew}")
+
+    body = (tlv(0x16, b"IM4P") + tlv(0x16, img["type"].encode())
+            + tlv(0x16, img["version"].encode()) + tlv(0x04, payload) + props)
+    open(out, "wb").write(tlv(0x30, body))
+    print(f"\npackaged {out}: {len(props)}-byte properties element spliced, "
+          "uncompressed (the only form confirmed to boot)")
+
+
+def stamp_build_tag(d, spec, rng=None):
+    """Splice a RANDOM tag into every copy of the kernel version string.
+
+    A patched kernel that only misbehaves on failure is silent both when it
+    works and when it never ran.  The tag is what makes those distinguishable:
+    `uname -a` on the device names exactly which image booted.  Same length, in
+    place, so nothing moves.
+    """
+    mk = spec
+    if not mk:
+        return None
+    stock = mk["stock"].encode()
+    n = d.count(stock)
+    if n != mk.get("count", 2):
+        raise SystemExit(f"expected {mk.get('count', 2)} copies of "
+                         f"{mk['stock']!r} in the image, found {n}")
+    keep = stock[stock.index(b"_"):]                  # e.g. b"_ARM64_T8150"
+    room = len(stock) - len(keep)
+    prefix = mk.get("prefix", "IK")
+    body = (rng or secrets.token_hex(16).upper())[:max(0, room - len(prefix))]
+    tag = (prefix + body)[:room].ljust(room, "0")
+    marker = tag.encode() + keep
+    assert len(marker) == len(stock)
+    d[:] = bytes(d).replace(stock, marker)
+    return marker.decode()
